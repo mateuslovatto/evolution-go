@@ -1,0 +1,69 @@
+name: Build and Publish SBX Image
+
+# Fork do SBX: compila a branch `sbx` e publica em ghcr.io/<dono>/evolution-go.
+# Pull requests para `sbx` só compilam (sem publicar).
+
+on:
+  push:
+    branches:
+      - sbx
+  pull_request:
+    branches:
+      - sbx
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build${{ github.event_name != 'pull_request' && ' and Publish' || '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        run: |
+          base="$(cat VERSION 2>/dev/null || echo '0.0.0')"
+          echo "base=${base}" >> "$GITHUB_OUTPUT"
+          echo "full=${base}-sbx.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/evolution-go
+          tags: |
+            type=raw,value=${{ steps.version.outputs.full }}
+            type=raw,value=${{ steps.version.outputs.base }}-sbx-latest
+            type=sha,prefix=sha-
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build${{ github.event_name != 'pull_request' && ' and push' || '' }}
+        id: docker_build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=${{ steps.version.outputs.full }}
+
+      - name: Image digest
+        run: echo "${{ steps.docker_build.outputs.digest }}"
