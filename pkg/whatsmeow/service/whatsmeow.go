@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/image/webp"
@@ -135,6 +136,10 @@ type MyClient struct {
 	natsProducer       producer_interfaces.Producer
 	loggerWrapper      *logger_wrapper.LoggerManager
 	qrcodeCount        int
+	// qrExpired is set by teardownQR right before it signals the kill channel, so
+	// StartClient's kill branch can tell a QR expiry apart from other kill signals
+	// (logout, disconnect, reconnect) and skip the automatic restart.
+	qrExpired          atomic.Bool
 	passkeyCeremony    *ceremony.Store
 }
 
@@ -642,6 +647,16 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 				go mycli.service.SendToGlobalQueues(postMap["event"].(string), values, mycli.userID)
 			}
 
+			// A QR that nobody scanned must not restart the client: restarting
+			// here generated new QRs forever (and, before the shared sqlstore
+			// container, leaked a Postgres pool per cycle). The next pairing
+			// attempt starts a fresh client on demand (/instance/qr, /instance/pair
+			// or /instance/connect).
+			if mycli.qrExpired.Load() {
+				w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] QR expired: client stopped until the next connect/QR request", cd.Instance.Id)
+				return
+			}
+
 			// restart client
 			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Restarting client", cd.Instance.Id)
 			w.StartClient(cd)
@@ -866,6 +881,7 @@ func (mycli *MyClient) teardownQR(reason string, forceLogout bool) {
 	// maps (it is the single writer for this instance). Blocking send mirrors
 	// the original timeout branch so the signal is never dropped.
 	mycli.loggerWrapper.GetLogger(instanceID).LogWarn("[%s] QR timeout — signaling kill channel", instanceID)
+	mycli.qrExpired.Store(true)
 	if killChan, exists := mycli.killChannel[instanceID]; exists {
 		killChan <- true
 	}
