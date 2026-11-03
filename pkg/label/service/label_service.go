@@ -56,47 +56,18 @@ type EditLabelStruct struct {
 	Deleted bool   `json:"deleted"`
 }
 
-func (l *labelService) ensureClientConnected(instanceId string) (*whatsmeow.Client, error) {
-	client := l.clientPointer[instanceId]
-	l.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Checking client connection status - Client exists: %v", instanceId, client != nil)
-
-	if client == nil {
-		l.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] No client found, attempting to start new instance", instanceId)
-		err := l.whatsmeowService.StartInstance(instanceId)
-		if err != nil {
-			l.loggerWrapper.GetLogger(instanceId).LogError("[%s] Failed to start instance: %v", instanceId, err)
-			return nil, errors.New("no active session found")
-		}
-
-		l.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Instance started, waiting 2 seconds...", instanceId)
-		time.Sleep(2 * time.Second)
-
-		client = l.clientPointer[instanceId]
-		l.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Checking new client - Exists: %v, Connected: %v",
-			instanceId,
-			client != nil,
-			client != nil && client.IsConnected())
-
-		if client == nil || !client.IsConnected() {
-			l.loggerWrapper.GetLogger(instanceId).LogError("[%s] New client validation failed - Exists: %v, Connected: %v",
-				instanceId,
-				client != nil,
-				client != nil && client.IsConnected())
-			return nil, errors.New("no active session found")
-		}
-	} else if !client.IsConnected() {
-		l.loggerWrapper.GetLogger(instanceId).LogError("[%s] Existing client is disconnected - Connected status: %v",
-			instanceId,
-			client.IsConnected())
-		return nil, errors.New("client disconnected")
+// connectedClient returns the client already in memory. It never calls
+// StartInstance: starting a client for an unpaired instance opens a QR session
+// (the vector of the 29/10 incident).
+func (l *labelService) connectedClient(instanceId string) (*whatsmeow.Client, error) {
+	if err := l.checkConnected(instanceId); err != nil {
+		return nil, err
 	}
-
-	l.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Client successfully validated - Connected: %v", instanceId, client.IsConnected())
-	return client, nil
+	return l.clientPointer[instanceId], nil
 }
 
 func (l *labelService) ChatLabel(data *ChatLabelStruct, instance *instance_model.Instance) error {
-	client, err := l.ensureClientConnected(instance.Id)
+	client, err := l.connectedClient(instance.Id)
 	if err != nil {
 		return err
 	}
@@ -121,7 +92,7 @@ func (l *labelService) ChatLabel(data *ChatLabelStruct, instance *instance_model
 }
 
 func (l *labelService) MessageLabel(data *MessageLabelStruct, instance *instance_model.Instance) error {
-	client, err := l.ensureClientConnected(instance.Id)
+	client, err := l.connectedClient(instance.Id)
 	if err != nil {
 		return err
 	}
@@ -147,7 +118,7 @@ func (l *labelService) MessageLabel(data *MessageLabelStruct, instance *instance
 }
 
 func (l *labelService) EditLabel(data *EditLabelStruct, instance *instance_model.Instance) error {
-	client, err := l.ensureClientConnected(instance.Id)
+	client, err := l.connectedClient(instance.Id)
 	if err != nil {
 		return err
 	}
@@ -167,7 +138,7 @@ func (l *labelService) EditLabel(data *EditLabelStruct, instance *instance_model
 }
 
 func (l *labelService) ChatUnlabel(data *ChatLabelStruct, instance *instance_model.Instance) error {
-	client, err := l.ensureClientConnected(instance.Id)
+	client, err := l.connectedClient(instance.Id)
 	if err != nil {
 		return err
 	}
@@ -192,7 +163,7 @@ func (l *labelService) ChatUnlabel(data *ChatLabelStruct, instance *instance_mod
 }
 
 func (l *labelService) MessageUnlabel(data *MessageLabelStruct, instance *instance_model.Instance) error {
-	client, err := l.ensureClientConnected(instance.Id)
+	client, err := l.connectedClient(instance.Id)
 	if err != nil {
 		return err
 	}
@@ -217,12 +188,9 @@ func (l *labelService) MessageUnlabel(data *MessageLabelStruct, instance *instan
 	return nil
 }
 
+// GetLabels apenas lê o banco: as etiquetas já foram gravadas pelo full sync e
+// pelo LabelEdit. Nunca sobe cliente (GET /label/list é chamado em toda listagem).
 func (l *labelService) GetLabels(instance *instance_model.Instance) ([]label_model.Label, error) {
-	_, err := l.ensureClientConnected(instance.Id)
-	if err != nil {
-		return nil, err
-	}
-
 	labels, err := l.labelRepository.GetAllLabelsByInstanceID(instance.Id)
 	if err != nil {
 		l.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error fetching labels from database: %v", instance.Id, err)
