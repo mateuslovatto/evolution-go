@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image/png"
 	"io"
@@ -441,6 +442,7 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	w.clientPointer[cd.Instance.Id] = client
 
+	mediaProxy := ""
 	if cd.IsProxy {
 		var proxyConfig ProxyConfig
 		err := json.Unmarshal([]byte(cd.Instance.Proxy), &proxyConfig)
@@ -479,6 +481,7 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 		if err != nil {
 			w.loggerWrapper.GetLogger(cd.Instance.Id).LogWarn("[%s] Proxy error, continuing without proxy: %v", cd.Instance.Id, err)
 		} else {
+			mediaProxy = proxyAddress
 			err = client.SetProxyAddress(proxyAddress)
 			if err != nil {
 				w.loggerWrapper.GetLogger(cd.Instance.Id).LogWarn("[%s] Proxy error, continuing without proxy: %v", cd.Instance.Id, err)
@@ -487,6 +490,11 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 			}
 		}
 	}
+
+	// SetMediaHTTPClient descarta o proxy configurado acima, por isso o cliente
+	// de mídia é montado com o mesmo proxy. O teto de bytes vem do contexto
+	// (WithMediaLimit); sem ele o transporte não limita.
+	client.SetMediaHTTPClient(mediaHTTPClient(mediaProxy))
 
 	client.EnableAutoReconnect = false
 	client.AutoTrustIdentity = true
@@ -546,6 +554,7 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 
 				// Desabilita o proxy
 				client.SetProxy(nil)
+				client.SetMediaHTTPClient(mediaHTTPClient(""))
 
 				// Tenta conectar sem proxy
 				err = client.Connect()
@@ -581,6 +590,7 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 
 				// Desabilita o proxy
 				client.SetProxy(nil)
+				client.SetMediaHTTPClient(mediaHTTPClient(""))
 
 				// Tenta conectar sem proxy
 				err = client.Connect()
@@ -1447,6 +1457,23 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				isMedia = true
 			}
 
+			// Teto da mídia embutida em base64 (WEBHOOK_MAX_MEDIA_BYTES): acima dele
+			// não baixa nem embute; o webhook segue com texto/legenda e mediaOmitted.
+			// Com MinIO a mídia vai por URL, então o teto não se aplica.
+			if isMedia && !mycli.config.MinioEnabled {
+				declaredSize, declaredMime := declaredMediaInfo(evt.Message)
+				if mediaExceedsCap(declaredSize, mycli.config.WebhookMaxMediaBytes) {
+					mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Media omitted from webhook (size %d > max %d) - ID: %s", mycli.userID, declaredSize, mycli.config.WebhookMaxMediaBytes, evt.Info.ID)
+					messageMap, ok := dataMap["Message"].(map[string]interface{})
+					if !ok {
+						messageMap = make(map[string]interface{})
+					}
+					markMediaOmitted(messageMap, declaredSize, mycli.config.WebhookMaxMediaBytes, declaredMime)
+					dataMap["Message"] = messageMap
+					isMedia = false
+				}
+			}
+
 			if isMedia {
 				mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Processing media message - ID: %s", mycli.userID, evt.Info.ID)
 
@@ -1456,8 +1483,13 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				var mimeType string
 				var mediaSize int64
 
-				// Create context with timeout for large files
-				downloadCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+				// Create context with timeout for large files. O teto de bytes vale
+				// no streaming quando a mídia vai em base64 (MinIO não muda).
+				downloadBaseCtx := context.Background()
+				if !mycli.config.MinioEnabled {
+					downloadBaseCtx = WithMediaLimit(downloadBaseCtx, mycli.config.WebhookMaxMediaBytes)
+				}
+				downloadCtx, cancel := context.WithTimeout(downloadBaseCtx, 5*time.Minute)
 				defer cancel()
 
 				downloadStart := time.Now()
@@ -1524,27 +1556,27 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 					}
 					// Handle associated child media messages
 				} else if associatedImg != nil {
-					data, err = mycli.WAClient.Download(context.Background(), associatedImg)
+					data, err = mycli.WAClient.Download(downloadCtx, associatedImg)
 					extension = ".jpg"
 					mimeType = "image/jpeg"
 					mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Processing associated child image message", mycli.userID)
 				} else if associatedAudio != nil {
-					data, err = mycli.WAClient.Download(context.Background(), associatedAudio)
+					data, err = mycli.WAClient.Download(downloadCtx, associatedAudio)
 					extension = ".ogg"
 					mimeType = "audio/ogg"
 					mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Processing associated child audio message", mycli.userID)
 				} else if associatedDocument != nil {
-					data, err = mycli.WAClient.Download(context.Background(), associatedDocument)
+					data, err = mycli.WAClient.Download(downloadCtx, associatedDocument)
 					extension = getExtensionFromMimeType(associatedDocument.GetMimetype())
 					mimeType = associatedDocument.GetMimetype()
 					mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Processing associated child document message", mycli.userID)
 				} else if associatedVideo != nil {
-					data, err = mycli.WAClient.Download(context.Background(), associatedVideo)
+					data, err = mycli.WAClient.Download(downloadCtx, associatedVideo)
 					extension = ".mp4"
 					mimeType = "video/mp4"
 					mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Processing associated child video message", mycli.userID)
 				} else if associatedSticker != nil {
-					data, err = mycli.WAClient.Download(context.Background(), associatedSticker)
+					data, err = mycli.WAClient.Download(downloadCtx, associatedSticker)
 					extension = ".png"
 					mimeType = "image/png"
 					mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Processing associated child sticker message", mycli.userID)
@@ -1622,6 +1654,10 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 							messageMap["mediaUrl"] = mediaURL
 							messageMap["mimetype"] = mimeType
 						}
+					} else if mediaExceedsCap(int64(len(data)), mycli.config.WebhookMaxMediaBytes) {
+						// FileLength ausente ou menor que o real: o teto vale sobre o baixado.
+						mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Media omitted from webhook after download (size %d > max %d) - ID: %s", mycli.userID, len(data), mycli.config.WebhookMaxMediaBytes, evt.Info.ID)
+						markMediaOmitted(messageMap, int64(len(data)), mycli.config.WebhookMaxMediaBytes, mimeType)
 					} else {
 						mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Encoding to base64 - ID: %s, Size: %d bytes", mycli.userID, evt.Info.ID, len(data))
 						encodeStart := time.Now()
@@ -1633,7 +1669,15 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 						messageMap["base64"] = encodeData
 					}
 				} else {
-					mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Skipping media storage due to download failure - ID: %s", mycli.userID, evt.Info.ID)
+					var tooLarge *MediaTooLargeError
+					if errors.As(err, &tooLarge) && !mycli.config.MinioEnabled {
+						// FileLength veio ausente ou menor que o real: o transporte
+						// cortou o download no teto e o webhook segue sem base64.
+						mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Media omitted from webhook after capped download (limit %d) - ID: %s", mycli.userID, tooLarge.Max, evt.Info.ID)
+						markMediaOmitted(messageMap, tooLarge.Size, tooLarge.Max, mimeType)
+					} else {
+						mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Skipping media storage due to download failure - ID: %s", mycli.userID, evt.Info.ID)
+					}
 				}
 
 				dataMap["Message"] = messageMap

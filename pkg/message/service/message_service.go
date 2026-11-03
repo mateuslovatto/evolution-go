@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	config "github.com/evolution-foundation/evolution-go/pkg/config"
 	instance_model "github.com/evolution-foundation/evolution-go/pkg/instance/model"
 	logger_wrapper "github.com/evolution-foundation/evolution-go/pkg/logger"
 	message_model "github.com/evolution-foundation/evolution-go/pkg/message/model"
@@ -39,6 +40,7 @@ type messageService struct {
 	messageRepository message_repository.MessageRepository
 	whatsmeowService  whatsmeow_service.WhatsmeowService
 	loggerWrapper     *logger_wrapper.LoggerManager
+	config            *config.Config
 }
 
 type ReactStruct struct {
@@ -72,6 +74,9 @@ type MarkPlayedStruct struct {
 type DownloadMediaStruct struct {
 	Message *waE2E.Message `json:"message"`
 }
+
+// MediaTooLargeError reexporta o erro do whatsmeow para o handler responder 413.
+type MediaTooLargeError = whatsmeow_service.MediaTooLargeError
 
 type MessageStatusStruct struct {
 	Id string `json:"id"`
@@ -393,52 +398,71 @@ func (m *messageService) DownloadMedia(data *DownloadMediaStruct, instance *inst
 		}
 	}
 
+	maxBytes := m.mediaMaxBytes()
+
+	// Contexto da requisição (cancelável) e teto de bytes no download real: o
+	// FileLength do proto pode faltar ou mentir.
+	downloadCtx := context.Background()
+	if request != nil {
+		downloadCtx = request.Context()
+	}
+	downloadCtx = whatsmeow_service.WithMediaLimit(downloadCtx, maxBytes)
+
+	download := func(media whatsmeow.DownloadableMessage, declared int64) ([]byte, error) {
+		if maxBytes > 0 && declared > maxBytes {
+			return nil, &whatsmeow_service.MediaTooLargeError{Size: declared, Max: maxBytes}
+		}
+		downloaded, err := client.Download(downloadCtx, media)
+		if err != nil {
+			return nil, err
+		}
+		if maxBytes > 0 && int64(len(downloaded)) > maxBytes {
+			return nil, &whatsmeow_service.MediaTooLargeError{Size: int64(len(downloaded)), Max: maxBytes}
+		}
+		return downloaded, nil
+	}
+
 	if img != nil {
-		mediaData, err = client.Download(context.Background(), img)
+		mediaData, err = download(img, int64(img.GetFileLength()))
 		if err != nil {
 			m.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Failed to download image", instance.Id)
-			msg := fmt.Sprintf("Failed to download image %v", err)
-			return nil, "", errors.New(msg)
+			return nil, "", mediaDownloadError("image", err)
 		}
 		mimetype = img.GetMimetype()
 	}
 
 	if audio != nil {
-		mediaData, err = client.Download(context.Background(), audio)
+		mediaData, err = download(audio, int64(audio.GetFileLength()))
 		if err != nil {
 			m.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Failed to download audio", instance.Id)
-			msg := fmt.Sprintf("Failed to download audio %v", err)
-			return nil, "", errors.New(msg)
+			return nil, "", mediaDownloadError("audio", err)
 		}
 		mimetype = audio.GetMimetype()
 	}
 
 	if document != nil {
-		mediaData, err = client.Download(context.Background(), document)
+		mediaData, err = download(document, int64(document.GetFileLength()))
 		if err != nil {
 			m.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Failed to download document", instance.Id)
-			msg := fmt.Sprintf("Failed to download document %v", err)
-			return nil, "", errors.New(msg)
+			return nil, "", mediaDownloadError("document", err)
 		}
 		mimetype = document.GetMimetype()
 	}
 
 	if video != nil {
-		mediaData, err = client.Download(context.Background(), video)
+		mediaData, err = download(video, int64(video.GetFileLength()))
 		if err != nil {
 			m.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Failed to download video", instance.Id)
-			msg := fmt.Sprintf("Failed to download video %v", err)
-			return nil, "", errors.New(msg)
+			return nil, "", mediaDownloadError("video", err)
 		}
 		mimetype = video.GetMimetype()
 	}
 
 	if sticker != nil {
-		mediaData, err = client.Download(context.Background(), sticker)
+		mediaData, err = download(sticker, int64(sticker.GetFileLength()))
 		if err != nil {
 			m.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Failed to download sticker", instance.Id)
-			msg := fmt.Sprintf("Failed to download sticker %v", err)
-			return nil, "", errors.New(msg)
+			return nil, "", mediaDownloadError("sticker", err)
 		}
 		mimetype = sticker.GetMimetype()
 	}
@@ -446,6 +470,23 @@ func (m *messageService) DownloadMedia(data *DownloadMediaStruct, instance *inst
 	dataURL := dataurl.New(mediaData, mimetype)
 
 	return dataURL, ts.String(), nil
+}
+
+// mediaMaxBytes devolve o teto de mídia (0 = desligado).
+func (m *messageService) mediaMaxBytes() int64 {
+	if m.config == nil {
+		return 0
+	}
+	return m.config.WebhookMaxMediaBytes
+}
+
+// mediaDownloadError preserva o erro de tamanho (handler responde 413).
+func mediaDownloadError(kind string, err error) error {
+	var tooLarge *whatsmeow_service.MediaTooLargeError
+	if errors.As(err, &tooLarge) {
+		return tooLarge
+	}
+	return fmt.Errorf("Failed to download %s %v", kind, err)
 }
 
 func (m *messageService) GetMessageStatus(data *MessageStatusStruct, instance *instance_model.Instance) (*message_model.Message, string, error) {
@@ -529,12 +570,14 @@ func NewMessageService(
 	clientPointer map[string]*whatsmeow.Client,
 	messageRepository message_repository.MessageRepository,
 	whatsmeowService whatsmeow_service.WhatsmeowService,
+	config *config.Config,
 	loggerWrapper *logger_wrapper.LoggerManager,
 ) MessageService {
 	return &messageService{
 		clientPointer:     clientPointer,
 		messageRepository: messageRepository,
 		whatsmeowService:  whatsmeowService,
+		config:            config,
 		loggerWrapper:     loggerWrapper,
 	}
 }

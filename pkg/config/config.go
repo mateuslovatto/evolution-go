@@ -29,6 +29,7 @@ type Config struct {
 	WaDebug              string
 	LogType              string
 	WebhookFiles         bool
+	WebhookMaxMediaBytes int64
 	ConnectOnStartup     bool
 	OsName               string
 	AmqpUrl              string
@@ -350,6 +351,7 @@ func Load() *Config {
 		WaDebug:              waDebug,
 		LogType:              logType,
 		WebhookFiles:         webhookFiles == "true",
+		WebhookMaxMediaBytes: parseWebhookMaxMediaBytes(os.Getenv(config_env.WEBHOOK_MAX_MEDIA_BYTES)),
 		ConnectOnStartup:     connectOnStartup == "true",
 		OsName:               osName,
 		AmqpUrl:              amqpUrl,

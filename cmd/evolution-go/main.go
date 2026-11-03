@@ -189,7 +189,7 @@ func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.C
 	)
 	sendMessageService := send_service.NewSendService(clientPointer, whatsmeowService, config, loggerWrapper)
 	userService := user_service.NewUserService(clientPointer, whatsmeowService, loggerWrapper)
-	messageService := message_service.NewMessageService(clientPointer, messageRepository, whatsmeowService, loggerWrapper)
+	messageService := message_service.NewMessageService(clientPointer, messageRepository, whatsmeowService, config, loggerWrapper)
 	chatService := chat_service.NewChatService(clientPointer, whatsmeowService, loggerWrapper)
 	groupService := group_service.NewGroupService(clientPointer, whatsmeowService, loggerWrapper)
 	callService := call_service.NewCallService(clientPointer, whatsmeowService, loggerWrapper)
