@@ -230,7 +230,7 @@ func (m *messageService) React(data *ReactStruct, instance *instance_model.Insta
 }
 
 func (m *messageService) ChatPresence(data *ChatPresenceStruct, instance *instance_model.Instance) (string, error) {
-	client, err := m.ensureClientConnected(instance.Id)
+	client, err := whatsmeow_service.ConnectedClient(m.clientPointer, instance.Id)
 	if err != nil {
 		return "", err
 	}
@@ -366,7 +366,7 @@ func (m *messageService) MarkPlayed(data *MarkPlayedStruct, instance *instance_m
 }
 
 func (m *messageService) DownloadMedia(data *DownloadMediaStruct, instance *instance_model.Instance, request *http.Request) (*dataurl.DataURL, string, error) {
-	client, err := m.ensureClientConnected(instance.Id)
+	client, err := whatsmeow_service.ConnectedClient(m.clientPointer, instance.Id)
 	if err != nil {
 		return nil, "", err
 	}

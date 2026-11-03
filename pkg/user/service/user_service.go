@@ -316,7 +316,7 @@ func (u *userService) mergeCheckUserResults(original, retry *CheckUserCollection
 }
 
 func (u *userService) GetAvatar(data *GetAvatarStruct, instance *instance_model.Instance) (*types.ProfilePictureInfo, error) {
-	client, err := u.ensureClientConnected(instance.Id)
+	client, err := whatsmeow_service.ConnectedClient(u.clientPointer, instance.Id)
 	if err != nil {
 		return nil, err
 	}
