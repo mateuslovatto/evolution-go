@@ -1,6 +1,8 @@
 package label_repository
 
 import (
+	"time"
+
 	label_model "github.com/evolution-foundation/evolution-go/pkg/label/model"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -13,6 +15,18 @@ type LabelRepository interface {
 	DeleteLabel(id string) error
 	GetAllLabelsByInstanceID(instanceID string) ([]label_model.Label, error)
 	UpsertLabel(label label_model.Label) error
+	DeleteLabelByLabelID(instanceID string, labelID string) error
+	DeleteLabelsUpdatedBefore(instanceID string, before time.Time) error
+}
+
+func (l *labelRepository) DeleteLabelByLabelID(instanceID string, labelID string) error {
+	return l.db.Where("instance_id = ? AND label_id = ?", instanceID, labelID).Delete(&label_model.Label{}).Error
+}
+
+// DeleteLabelsUpdatedBefore removes the instance labels not upserted since
+// `before` (rows from before the updated_at column existed are NULL).
+func (l *labelRepository) DeleteLabelsUpdatedBefore(instanceID string, before time.Time) error {
+	return l.db.Where("instance_id = ? AND (updated_at < ? OR updated_at IS NULL)", instanceID, before).Delete(&label_model.Label{}).Error
 }
 
 type labelRepository struct {
@@ -56,13 +70,17 @@ func (l *labelRepository) GetAllLabelsByInstanceID(instanceID string) ([]label_m
 }
 
 func (l *labelRepository) UpsertLabel(label label_model.Label) error {
+	now := time.Now()
+	label.UpdatedAt = now
+	// Map (not struct) so empty values and updated_at are always written.
 	return l.db.Where("instance_id = ? AND label_id = ?",
 		label.InstanceID,
 		label.LabelID,
-	).Assign(label_model.Label{
-		LabelName:    label.LabelName,
-		LabelColor:   label.LabelColor,
-		PredefinedId: label.PredefinedId,
+	).Assign(map[string]interface{}{
+		"label_name":    label.LabelName,
+		"label_color":   label.LabelColor,
+		"predefined_id": label.PredefinedId,
+		"updated_at":    now,
 	}).FirstOrCreate(&label).Error
 }
 

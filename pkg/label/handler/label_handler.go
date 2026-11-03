@@ -1,6 +1,7 @@
 package label_handler
 
 import (
+	"errors"
 	"net/http"
 
 	instance_model "github.com/evolution-foundation/evolution-go/pkg/instance/model"
@@ -15,6 +16,41 @@ type LabelHandler interface {
 	ChatUnlabel(ctx *gin.Context)
 	MessageUnlabel(ctx *gin.Context)
 	GetLabels(ctx *gin.Context)
+	SyncLabels(ctx *gin.Context)
+}
+
+// Sync labels
+// @Summary Resync labels from WhatsApp
+// @Description Clears the stored labels of the instance and refetches them with a full app state sync (once every 10 minutes per instance)
+// @Tags Label
+// @Produce json
+// @Success 200 {object} gin.H "success"
+// @Failure 429 {object} gin.H "Cooldown or WhatsApp rate limit"
+// @Failure 500 {object} gin.H "Internal server error"
+// @Router /label/sync [post]
+func (l *labelHandler) SyncLabels(ctx *gin.Context) {
+	getInstance, exists := ctx.Get("instance")
+	instance, ok := getInstance.(*instance_model.Instance)
+	if !exists || !ok || instance == nil {
+		ctx.JSON(http.StatusUnauthorized, gin.H{"error": "instance not found"})
+		return
+	}
+
+	err := l.labelService.SyncLabels(instance)
+	if err != nil {
+		if errors.Is(err, label_service.ErrLabelSyncCooldown) || errors.Is(err, label_service.ErrLabelSyncRateLimited) {
+			ctx.JSON(http.StatusTooManyRequests, gin.H{"error": err.Error()})
+			return
+		}
+		if errors.Is(err, label_service.ErrLabelSyncNotConnected) {
+			ctx.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	ctx.JSON(http.StatusOK, gin.H{"message": "success"})
 }
 
 type labelHandler struct {

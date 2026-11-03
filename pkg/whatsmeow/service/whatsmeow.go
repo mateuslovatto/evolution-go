@@ -40,9 +40,9 @@ import (
 	instance_model "github.com/evolution-foundation/evolution-go/pkg/instance/model"
 	instance_repository "github.com/evolution-foundation/evolution-go/pkg/instance/repository"
 	"github.com/evolution-foundation/evolution-go/pkg/internal/event_types"
-	label_model "github.com/evolution-foundation/evolution-go/pkg/label/model"
 	label_repository "github.com/evolution-foundation/evolution-go/pkg/label/repository"
 	logger_wrapper "github.com/evolution-foundation/evolution-go/pkg/logger"
+	gologger "github.com/gomessguii/logger"
 	message_model "github.com/evolution-foundation/evolution-go/pkg/message/model"
 	message_repository "github.com/evolution-foundation/evolution-go/pkg/message/repository"
 	"github.com/evolution-foundation/evolution-go/pkg/passkey/ceremony"
@@ -434,6 +434,10 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 	}
 	clientLog := waLog.Stdout("Client", minLevel, true)
 	client := whatsmeow.NewClient(deviceStore, clientLog)
+	// Emit app state events on full sync so labels (LabelEdit) reach the database
+	// after pairing. Every other full-sync event is dropped at the top of
+	// myEventHandler (see isFromFullSync), so the fork output stays unchanged.
+	client.EmitAppStateEventsOnFullSync = true
 
 	w.clientPointer[cd.Instance.Id] = client
 
@@ -888,6 +892,15 @@ func (mycli *MyClient) teardownQR(reason string, forceLogout bool) {
 }
 
 func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
+	if isFromFullSync(rawEvt) {
+		// Full-sync app state events carry the whole account state. Only labels
+		// are persisted; nothing else (webhook, queues, UpdateConnected) runs.
+		if evt, ok := rawEvt.(*events.LabelEdit); ok {
+			mycli.persistLabelEdit(evt)
+		}
+		return
+	}
+
 	userID := mycli.userID
 	postMap := make(map[string]interface{})
 	postMap["data"] = rawEvt
@@ -1865,7 +1878,13 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] History sync event received %+v", mycli.userID, evt.Data.SyncType)
 	case *events.AppState:
-		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] App state event received %+v", mycli.userID, evt)
+		// One generic AppState arrives per mutation of a full sync and carries the
+		// whole account state (contacts, chats): never log its content, and keep it
+		// out of instance.log. Only the mutation kind goes to the stdout DEBUG log.
+		if len(evt.Index) > 0 {
+			gologger.LogDebug("[%s] App state event received: %s", mycli.userID, evt.Index[0])
+		}
+		return
 	case *events.LoggedOut:
 		doWebhook = true
 		postMap["event"] = "LoggedOut"
@@ -2027,18 +2046,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		postMap["event"] = "LabelEdit"
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Got label edit %+v", mycli.userID, evt.Action)
 
-		label := label_model.Label{
-			InstanceID:   mycli.userID,
-			LabelID:      evt.LabelID,
-			LabelName:    utils.GetStringValue(evt.Action.Name),
-			LabelColor:   fmt.Sprintf("%d", evt.Action.Color),
-			PredefinedId: fmt.Sprintf("%d", evt.Action.PredefinedID),
-		}
-
-		err := mycli.labelRepository.UpsertLabel(label)
-		if err != nil {
-			mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Failed to upsert label: %v", mycli.userID, err)
-		}
+		mycli.persistLabelEdit(evt)
 	case *events.LabelAssociationChat:
 		doWebhook = true
 		postMap["event"] = "LabelAssociationChat"

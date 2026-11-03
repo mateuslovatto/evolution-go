@@ -23,6 +23,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Bloqueia a imagem se os testes do handler de eventos ou de etiquetas falharem.
+      - name: Go tests
+        run: go test ./pkg/whatsmeow/... ./pkg/label/...
+
       - name: Read version
         id: version
         run: |
