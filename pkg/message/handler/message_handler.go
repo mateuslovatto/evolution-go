@@ -6,6 +6,7 @@ import (
 
 	instance_model "github.com/evolution-foundation/evolution-go/pkg/instance/model"
 	message_service "github.com/evolution-foundation/evolution-go/pkg/message/service"
+	whatsmeow_service "github.com/evolution-foundation/evolution-go/pkg/whatsmeow/service"
 	"github.com/gin-gonic/gin"
 )
 
@@ -109,7 +110,7 @@ func (m *messageHandler) ChatPresence(ctx *gin.Context) {
 
 	ts, err := m.messageService.ChatPresence(data, instance)
 	if err != nil {
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeMessageServiceError(ctx, err)
 		return
 	}
 
@@ -424,6 +425,16 @@ func writeDownloadMediaError(ctx *gin.Context, err error) {
 			"mediaSize":     tooLarge.Size,
 			"mediaMaxBytes": tooLarge.Max,
 		})
+		return
+	}
+	writeMessageServiceError(ctx, err)
+}
+
+// writeMessageServiceError responde 409 quando não há cliente conectado e
+// pareado em memória (a rota não sobe cliente) e 500 para o resto.
+func writeMessageServiceError(ctx *gin.Context, err error) {
+	if errors.Is(err, whatsmeow_service.ErrInstanceNotConnected) {
+		ctx.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
 	ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})

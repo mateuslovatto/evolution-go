@@ -1,10 +1,12 @@
 package user_handler
 
 import (
+	"errors"
 	"net/http"
 
 	instance_model "github.com/evolution-foundation/evolution-go/pkg/instance/model"
 	user_service "github.com/evolution-foundation/evolution-go/pkg/user/service"
+	whatsmeow_service "github.com/evolution-foundation/evolution-go/pkg/whatsmeow/service"
 	"github.com/gin-gonic/gin"
 )
 
@@ -148,7 +150,7 @@ func (u *userHandler) GetAvatar(ctx *gin.Context) {
 
 	pic, err := u.userService.GetAvatar(data, instance)
 	if err != nil {
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeUserServiceError(ctx, err)
 		return
 	}
 
@@ -548,4 +550,14 @@ func NewUserHandler(
 	return &userHandler{
 		userService: userService,
 	}
+}
+
+// writeUserServiceError responde 409 quando não há cliente conectado e pareado
+// em memória (a rota não sobe cliente) e 500 para o resto.
+func writeUserServiceError(ctx *gin.Context, err error) {
+	if errors.Is(err, whatsmeow_service.ErrInstanceNotConnected) {
+		ctx.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 }
