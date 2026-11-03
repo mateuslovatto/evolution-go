@@ -96,7 +96,7 @@ func (l *labelHandler) ChatLabel(ctx *gin.Context) {
 
 	err = l.labelService.ChatLabel(data, instance)
 	if err != nil {
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeLabelServiceError(ctx, err)
 		return
 	}
 
@@ -147,7 +147,7 @@ func (l *labelHandler) MessageLabel(ctx *gin.Context) {
 
 	err = l.labelService.MessageLabel(data, instance)
 	if err != nil {
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeLabelServiceError(ctx, err)
 		return
 	}
 
@@ -193,7 +193,7 @@ func (l *labelHandler) EditLabel(ctx *gin.Context) {
 
 	err = l.labelService.EditLabel(data, instance)
 	if err != nil {
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeLabelServiceError(ctx, err)
 		return
 	}
 
@@ -239,7 +239,7 @@ func (l *labelHandler) ChatUnlabel(ctx *gin.Context) {
 
 	err = l.labelService.ChatUnlabel(data, instance)
 	if err != nil {
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeLabelServiceError(ctx, err)
 		return
 	}
 
@@ -290,7 +290,7 @@ func (l *labelHandler) MessageUnlabel(ctx *gin.Context) {
 
 	err = l.labelService.MessageUnlabel(data, instance)
 	if err != nil {
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeLabelServiceError(ctx, err)
 		return
 	}
 
@@ -317,7 +317,7 @@ func (l *labelHandler) GetLabels(ctx *gin.Context) {
 
 	labels, err := l.labelService.GetLabels(instance)
 	if err != nil {
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeLabelServiceError(ctx, err)
 		return
 	}
 
@@ -330,4 +330,14 @@ func NewLabelHandler(
 	return &labelHandler{
 		labelService: labelService,
 	}
+}
+
+// writeLabelServiceError responde 409 quando não há cliente conectado e pareado
+// em memória (as rotas de etiqueta nunca sobem cliente) e 500 para o resto.
+func writeLabelServiceError(ctx *gin.Context, err error) {
+	if errors.Is(err, label_service.ErrLabelSyncNotConnected) {
+		ctx.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 }
