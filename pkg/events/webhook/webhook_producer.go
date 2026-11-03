@@ -58,6 +58,10 @@ func (p *webhookProducer) sendWebhookWithRetry(url string, body []byte, maxRetri
 			return
 		}
 		p.loggerWrapper.GetLogger(userID).LogWarn("[%s] webhook failed - url: %s, attempt: %d, error: %v", userID, url, i+1, err)
+		if !isRetryableStatus(statusCode) {
+			p.loggerWrapper.GetLogger(userID).LogError("[%s] webhook rejected with non-retryable status %d, not retrying - url: %s", userID, statusCode, url)
+			return
+		}
 
 		time.Sleep(retryInterval)
 	}

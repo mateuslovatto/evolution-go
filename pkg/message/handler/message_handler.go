@@ -1,6 +1,7 @@
 package message_handler
 
 import (
+	"errors"
 	"net/http"
 
 	instance_model "github.com/evolution-foundation/evolution-go/pkg/instance/model"
@@ -228,6 +229,7 @@ func (m *messageHandler) MarkPlayed(ctx *gin.Context) {
 // @Param message body message_service.DownloadMediaStruct true "Download media"
 // @Success 200 {object} gin.H "success"
 // @Failure 400 {object} gin.H "Error on validation"
+// @Failure 413 {object} gin.H "Media above WEBHOOK_MAX_MEDIA_BYTES"
 // @Failure 500 {object} gin.H "Internal server error"
 // @Router /message/downloadmedia [post]
 func (m *messageHandler) DownloadMedia(ctx *gin.Context) {
@@ -248,7 +250,7 @@ func (m *messageHandler) DownloadMedia(ctx *gin.Context) {
 
 	dataUrl, ts, err := m.messageService.DownloadMedia(data, instance, ctx.Request)
 	if err != nil {
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeDownloadMediaError(ctx, err)
 		return
 	}
 
@@ -411,6 +413,20 @@ func (m *messageHandler) EditMessage(ctx *gin.Context) {
 	}
 
 	ctx.JSON(http.StatusOK, gin.H{"message": "success", "data": responseData})
+}
+
+// writeDownloadMediaError responde 413 quando o arquivo passa do teto de mídia.
+func writeDownloadMediaError(ctx *gin.Context, err error) {
+	var tooLarge *message_service.MediaTooLargeError
+	if errors.As(err, &tooLarge) {
+		ctx.JSON(http.StatusRequestEntityTooLarge, gin.H{
+			"error":         tooLarge.Error(),
+			"mediaSize":     tooLarge.Size,
+			"mediaMaxBytes": tooLarge.Max,
+		})
+		return
+	}
+	ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 }
 
 func NewMessageHandler(

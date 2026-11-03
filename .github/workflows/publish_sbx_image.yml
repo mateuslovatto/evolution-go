@@ -30,7 +30,7 @@ jobs:
 
       # Bloqueia a imagem se os testes do handler de eventos ou de etiquetas falharem.
       - name: Go tests
-        run: go test ./pkg/whatsmeow/... ./pkg/label/...
+        run: go test ./pkg/whatsmeow/... ./pkg/label/... ./pkg/events/webhook/... ./pkg/config/...
 
       - name: Read version
         id: version
