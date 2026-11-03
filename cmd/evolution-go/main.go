@@ -160,7 +160,7 @@ func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.C
 
 	instanceRepository := instance_repository.NewInstanceRepository(db)
 	messageRepository := message_repository.NewMessageRepository(db)
-	labelRepository := label_repository.NewLabelRepository(db)
+	labelRepository := label_repository.WithFailureCounter(label_repository.NewLabelRepository(db)) // shared by the event handler and /label/sync
 
 	whatsmeowService := whatsmeow_service.NewWhatsmeowService(
 		instanceRepository,

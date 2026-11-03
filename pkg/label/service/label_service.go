@@ -22,6 +22,7 @@ type LabelService interface {
 	ChatUnlabel(data *ChatLabelStruct, instance *instance_model.Instance) error
 	MessageUnlabel(data *MessageLabelStruct, instance *instance_model.Instance) error
 	GetLabels(instance *instance_model.Instance) ([]label_model.Label, error)
+	SyncLabels(instance *instance_model.Instance) error
 }
 
 type labelService struct {
@@ -29,6 +30,12 @@ type labelService struct {
 	whatsmeowService whatsmeow_service.WhatsmeowService
 	labelRepository  label_repository.LabelRepository
 	loggerWrapper    *logger_wrapper.LoggerManager
+
+	// /label/sync collaborators, replaceable in tests.
+	syncCooldown    *labelSyncCooldownTracker
+	connectionCheck func(instanceID string) error
+	fullSync        func(ctx context.Context, instanceID string) error
+	clock           func() time.Time // nil = time.Now
 }
 
 type ChatLabelStruct struct {
@@ -231,10 +238,14 @@ func NewLabelService(
 	labelRepository label_repository.LabelRepository,
 	loggerWrapper *logger_wrapper.LoggerManager,
 ) LabelService {
-	return &labelService{
+	svc := &labelService{
 		clientPointer:    clientPointer,
 		whatsmeowService: whatsmeowService,
 		labelRepository:  labelRepository,
 		loggerWrapper:    loggerWrapper,
+		syncCooldown:     newLabelSyncCooldownTracker(labelSyncCooldown),
 	}
+	svc.connectionCheck = svc.checkConnected
+	svc.fullSync = svc.fetchRegularAppState
+	return svc
 }
