@@ -109,8 +109,15 @@ type whatsmeowService struct {
 	// proxyRetryBackoff is the reconnect schedule after a mid-session proxy drop.
 	// nil uses 2s, 5s, 10s, 20s, then 60s forever.
 	proxyRetryBackoff []time.Duration
-	proxyRetryState   *proxyRetryRegistry
+	// proxyEOFRetryDelay is the single 5s retry after an EOF on start. Tests
+	// shorten it; production keeps 5s.
+	proxyEOFRetryDelay time.Duration
 }
+
+// processProxyRetryRegistry is one registry per process. A receiver copy (or a
+// value copy of the service) must still see the same cycles, so CancelProxyRetry
+// from the API stops the cycle started by the event handler.
+var processProxyRetryRegistry = &proxyRetryRegistry{cycles: make(map[string]chan struct{})}
 
 type proxyRetryRegistry struct {
 	mu     sync.Mutex
@@ -160,6 +167,10 @@ type MyClient struct {
 	// isProxy is true when this session was started with a proxy. Mid-session
 	// disconnects then become proxy_error and are reported to the SBX.
 	isProxy bool
+	// sessionEnded is set when WhatsApp ended the session (logout, ban, stream
+	// replaced or a terminal ConnectFailure). The kill branch must not restart
+	// and no proxy retry may be scheduled after it.
+	sessionEnded atomic.Bool
 }
 
 func (mycli *MyClient) persistMessageAsync(message message_model.Message) {
@@ -236,6 +247,56 @@ func proxyFailureReason(err error) string {
 	}
 }
 
+// InstanceProxyConfigured reports whether the instance JSON denotes a real
+// proxy. Create without a proxy stores "null"; an empty host means no instance
+// proxy. Invalid non-empty JSON counts as configured so the start fails closed
+// instead of silently dialing direct.
+func InstanceProxyConfigured(raw string) bool {
+	value := strings.TrimSpace(raw)
+	if value == "" || strings.EqualFold(value, "null") {
+		return false
+	}
+	var proxyConfig ProxyConfig
+	if err := json.Unmarshal([]byte(value), &proxyConfig); err != nil {
+		return true
+	}
+	return strings.TrimSpace(proxyConfig.Host) != ""
+}
+
+// GlobalProxyConfigured reports a complete PROXY_* policy.
+func GlobalProxyConfigured(host, port, username, password string) bool {
+	return strings.TrimSpace(host) != "" &&
+		strings.TrimSpace(port) != "" &&
+		strings.TrimSpace(username) != "" &&
+		strings.TrimSpace(password) != ""
+}
+
+// HasConfiguredProxy is the single "tem proxy?" decision used by the start,
+// Connect, boot and retry paths: instance proxy first, then the global policy.
+func HasConfiguredProxy(raw, globalHost, globalPort, globalUsername, globalPassword string) bool {
+	return InstanceProxyConfigured(raw) ||
+		GlobalProxyConfigured(globalHost, globalPort, globalUsername, globalPassword)
+}
+
+// isTerminalConnectFailureReason separates session/ban/outdated failures from
+// network ones. Terminal reasons must cancel the proxy retry: retrying cannot
+// fix a logged-out, banned or outdated client.
+func isTerminalConnectFailureReason(reason events.ConnectFailureReason) bool {
+	if reason.IsLoggedOut() {
+		return true
+	}
+	switch reason {
+	case events.ConnectFailureTempBanned,
+		events.ConnectFailureClientOutdated,
+		events.ConnectFailureBadUserAgent,
+		events.ConnectFailureCATExpired,
+		events.ConnectFailureCATInvalid:
+		return true
+	default:
+		return false
+	}
+}
+
 // applyProxy configures the websocket (and returns the address for the media
 // client) when the instance has a proxy. Strict: any setup error is returned so
 // the caller can keep the instance disconnected instead of dialing direct.
@@ -245,8 +306,11 @@ func (w whatsmeowService) applyProxy(cd *ClientData, client *whatsmeow.Client) (
 	}
 
 	var proxyConfig ProxyConfig
-	if err := json.Unmarshal([]byte(cd.Instance.Proxy), &proxyConfig); err != nil {
-		return "", true, fmt.Errorf("invalid proxy config: %w", err)
+	raw := strings.TrimSpace(cd.Instance.Proxy)
+	if raw != "" && !strings.EqualFold(raw, "null") {
+		if err := json.Unmarshal([]byte(raw), &proxyConfig); err != nil {
+			return "", true, fmt.Errorf("invalid proxy config: %w", err)
+		}
 	}
 
 	proxyProtocol := proxyConfig.Protocol
@@ -286,12 +350,31 @@ func (w whatsmeowService) applyProxy(cd *ClientData, client *whatsmeow.Client) (
 // connectStrict connects the websocket. With a configured proxy there is no
 // direct fallback: any failure ends in failProxyStart (disconnected + event).
 func (w whatsmeowService) connectStrict(cd *ClientData, client *whatsmeow.Client, proxyConfigured bool) error {
+	return w.connectStrictWith(cd, client, proxyConfigured, client.Connect)
+}
+
+// connectStrictWith is connectStrict with the connect call injectable for tests.
+// On the first EOF through a proxy it emits ConnectFailure immediately (the SBX
+// pool reacts in ~2 s) and still keeps the single 5 s internal retry.
+func (w whatsmeowService) connectStrictWith(
+	cd *ClientData,
+	client *whatsmeow.Client,
+	proxyConfigured bool,
+	connect func() error,
+) error {
 	logger := w.loggerWrapper.GetLogger(cd.Instance.Id)
-	err := client.Connect()
+	err := connect()
 	if err != nil && strings.Contains(err.Error(), "EOF") {
-		logger.LogError("[%s] Erro de conexão WebSocket (EOF). Tentando reconectar em 5 segundos...", cd.Instance.Id)
-		time.Sleep(5 * time.Second)
-		err = client.Connect()
+		if proxyConfigured && !cd.silentProxyFailure {
+			w.emitConnectFailure(cd.Instance, "proxy_error:unreachable")
+		}
+		delay := w.proxyEOFRetryDelay
+		if delay <= 0 {
+			delay = 5 * time.Second
+		}
+		logger.LogError("[%s] Erro de conexão WebSocket (EOF). Tentando reconectar em %s...", cd.Instance.Id, delay)
+		time.Sleep(delay)
+		err = connect()
 	}
 	if err == nil {
 		return nil
@@ -359,14 +442,11 @@ func resolveOsName(instanceOsName, configOsName string) string {
 	return utils.WhatsAppGetUserOS()
 }
 
-// StartProxyRetry starts the single reconnect cycle for an instance whose
-// proxy-backed session dropped. One cycle per instance; SetProxy, RemoveProxy,
-// logout or delete cancel it.
+// proxyRegistry returns the process-wide registry. A copied service (or a
+// receiver copy) still sees the same cycles, so CancelProxyRetry from the API
+// reaches the cycle started by the event handler.
 func (w *whatsmeowService) proxyRegistry() *proxyRetryRegistry {
-	if w.proxyRetryState == nil {
-		w.proxyRetryState = &proxyRetryRegistry{cycles: make(map[string]chan struct{})}
-	}
-	return w.proxyRetryState
+	return processProxyRetryRegistry
 }
 
 func (w *whatsmeowService) StartProxyRetry(instanceId string) {
@@ -423,7 +503,8 @@ func (w *whatsmeowService) proxyRetryLoop(instanceId string, cancel chan struct{
 		case <-timer.C:
 		}
 		instance, err := w.instanceRepository.GetInstanceByID(instanceId)
-		if err != nil || instance == nil || instance.Jid == "" || instance.Proxy == "" {
+		if err != nil || instance == nil || instance.Jid == "" ||
+			!HasConfiguredProxy(instance.Proxy, w.config.ProxyHost, w.config.ProxyPort, w.config.ProxyUsername, w.config.ProxyPassword) {
 			// Logged session gone or proxy removed: nothing to retry.
 			w.endProxyRetry(instanceId, cancel)
 			return
@@ -495,7 +576,7 @@ func (w *whatsmeowService) markConnected(instance *instance_model.Instance) {
 	go w.CallWebhook(instance, queueName, raw)
 }
 
-func (w whatsmeowService) ReconnectClient(instanceId string) error {
+func (w *whatsmeowService) ReconnectClient(instanceId string) error {
 	w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Starting reconnection process - simulating restart", instanceId)
 
 	// Passo 1: Limpar conexão existente se houver
@@ -655,9 +736,19 @@ func (w *whatsmeowService) getStoreContainer() (*sqlstore.Container, error) {
 	return container, nil
 }
 
-func (w whatsmeowService) StartClient(cd *ClientData) {
+func (w *whatsmeowService) StartClient(cd *ClientData) {
 
 	w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Starting websocket connection to Whatsapp for user '%s'", cd.Instance.Id)
+
+	// Single decision for "tem proxy?" (instance JSON, then global PROXY_*).
+	// Defense in depth: a caller cannot start a proxy session as direct.
+	cd.IsProxy = HasConfiguredProxy(
+		cd.Instance.Proxy,
+		w.config.ProxyHost,
+		w.config.ProxyPort,
+		w.config.ProxyUsername,
+		w.config.ProxyPassword,
+	)
 
 	var deviceStore *store.Device
 	var err error
@@ -778,7 +869,7 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 	client.AutoTrustIdentity = true
 
 	mycli := &MyClient{
-		service:            &w,
+		service:            w,
 		Instance:           cd.Instance,
 		WAClient:           client,
 		eventHandlerID:     1,
@@ -902,6 +993,11 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 			// or /instance/connect).
 			if mycli.qrExpired.Load() {
 				w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] QR expired: client stopped until the next connect/QR request", cd.Instance.Id)
+				return
+			}
+
+			if mycli.sessionEnded.Load() {
+				w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Session ended (logout/ban/stream replaced): kill does not restart the client", cd.Instance.Id)
 				return
 			}
 
@@ -1132,6 +1228,16 @@ func (mycli *MyClient) teardownQR(reason string, forceLogout bool) {
 	mycli.qrExpired.Store(true)
 	if killChan, exists := mycli.killChannel[instanceID]; exists {
 		killChan <- true
+	}
+}
+
+// stopSession marks the session as ended and cancels the proxy retry. Used on
+// logout, ban, stream replacement and terminal ConnectFailure reasons: retrying
+// cannot fix these, and the LoggedOut kill must not restart a client.
+func (mycli *MyClient) stopSession() {
+	mycli.sessionEnded.Store(true)
+	if mycli.service != nil {
+		mycli.service.CancelProxyRetry(mycli.userID)
 	}
 }
 
@@ -1392,9 +1498,11 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		}
 	case *events.StreamReplaced:
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Received StreamReplaced event", mycli.userID)
+		mycli.stopSession()
 		return
 	case *events.TemporaryBan:
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] User received temporary ban for %s", mycli.userID, evt.Code.String())
+		mycli.stopSession()
 		doWebhook = true
 		postMap["event"] = "TemporaryBan"
 
@@ -2166,6 +2274,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	case *events.LoggedOut:
 		doWebhook = true
 		postMap["event"] = "LoggedOut"
+		mycli.stopSession()
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Logged out for reason %s", mycli.userID, evt.Reason.String())
 
 		// Limpar cache de userInfo para esta instância
@@ -2291,12 +2400,19 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		mycli.userInfoCache.Delete(mycli.Instance.Token)
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] UserInfo cache cleared for token: %s", mycli.userID, mycli.Instance.Token)
 
-		mycli.Instance.DisconnectReason = evt.Reason.String()
-		if mycli.isProxy {
-			// Mid-session failure with a proxy: the SBX pool needs the stable
-			// proxy_error category fast, not the whatsmeow reason text.
+		if isTerminalConnectFailureReason(evt.Reason) {
+			// Session ended, ban or outdated client: retrying through the proxy
+			// cannot fix it. Keep the original reason (not proxy_error).
+			mycli.stopSession()
+			mycli.Instance.DisconnectReason = evt.Reason.String()
+			postMap["data"] = map[string]interface{}{"reason": evt.Reason.String()}
+		} else if mycli.isProxy {
+			// Mid-session network failure with a proxy: the SBX pool needs the
+			// stable proxy_error category fast, not the whatsmeow reason text.
 			mycli.Instance.DisconnectReason = "proxy_error:unreachable"
 			postMap["data"] = map[string]interface{}{"reason": mycli.Instance.DisconnectReason}
+		} else {
+			mycli.Instance.DisconnectReason = evt.Reason.String()
 		}
 		mycli.Instance.Connected = false
 		err := mycli.instanceRepository.UpdateConnected(mycli.Instance.Id, mycli.Instance.Connected, mycli.Instance.DisconnectReason)
@@ -2304,6 +2420,11 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Error updating instance: %s", mycli.Instance.Id, err)
 		}
 	case *events.Disconnected:
+		if mycli.sessionEnded.Load() {
+			// The terminal event already stopped the cycle; the socket close that
+			// follows must not schedule it again.
+			return
+		}
 		doWebhook = true
 
 		// Limpar cache de userInfo para esta instância (mas não para reconexão automática)
@@ -2663,17 +2784,19 @@ func (w *whatsmeowService) sendToQueueOrWebhook(instance *instance_model.Instanc
 	}
 }
 
-func (w whatsmeowService) StartInstance(instanceId string) error {
+func (w *whatsmeowService) StartInstance(instanceId string) error {
 	return w.startInstance(instanceId, nil)
 }
 
-func (w whatsmeowService) startInstance(instanceId string, options *startOptions) error {
+func (w *whatsmeowService) startInstance(instanceId string, options *startOptions) error {
 	instance, err := w.instanceRepository.GetInstanceByID(instanceId)
 	if err != nil {
 		return err
 	}
 
-	if instance.Proxy == "" && w.config.ProxyHost != "" && w.config.ProxyPort != "" && w.config.ProxyUsername != "" && w.config.ProxyPassword != "" {
+	previousProxy := instance.Proxy
+	if !InstanceProxyConfigured(instance.Proxy) &&
+		GlobalProxyConfigured(w.config.ProxyHost, w.config.ProxyPort, w.config.ProxyUsername, w.config.ProxyPassword) {
 		proxyConfig := ProxyConfig{
 			Protocol: utils.NormalizeProxyProtocol(w.config.ProxyProtocol, w.config.ProxyPort),
 			Host:     w.config.ProxyHost,
@@ -2690,10 +2813,15 @@ func (w whatsmeowService) startInstance(instanceId string, options *startOptions
 
 		instance.Proxy = string(proxyJSON)
 
-		err = w.instanceRepository.UpdateProxy(instance.Id, instance.Proxy)
-		if err != nil {
-			w.loggerWrapper.GetLogger(instanceId).LogError("[%s] Failed to update instance: %s", instanceId, err)
-			return err
+		// Preserve the legacy behavior of persisting the global proxy only when
+		// the instance had no proxy string at all. "null" rows keep their value
+		// and resolve to the global on every start.
+		if strings.TrimSpace(previousProxy) == "" {
+			err = w.instanceRepository.UpdateProxy(instance.Id, instance.Proxy)
+			if err != nil {
+				w.loggerWrapper.GetLogger(instanceId).LogError("[%s] Failed to update instance: %s", instanceId, err)
+				return err
+			}
 		}
 	}
 
@@ -2735,24 +2863,17 @@ func (w whatsmeowService) startInstance(instanceId string, options *startOptions
 		Instance:      instance,
 		Subscriptions: subscribedEvents,
 		Phone:         "",
-		IsProxy:       false,
+		IsProxy: HasConfiguredProxy(
+			instance.Proxy,
+			w.config.ProxyHost,
+			w.config.ProxyPort,
+			w.config.ProxyUsername,
+			w.config.ProxyPassword,
+		),
 	}
 	if options != nil {
 		clientData.connectResult = options.connectResult
 		clientData.silentProxyFailure = options.silentProxyFailure
-	}
-
-	if instance.Proxy != "" {
-		var proxyConfig ProxyConfig
-		err := json.Unmarshal([]byte(instance.Proxy), &proxyConfig)
-		if err != nil {
-			w.loggerWrapper.GetLogger(instanceId).LogError("[%s] error unmarshalling proxy config", instanceId)
-			return err
-		}
-
-		if proxyConfig.Host != "" {
-			clientData.IsProxy = true
-		}
 	}
 
 	go w.StartClient(clientData)
@@ -2760,7 +2881,7 @@ func (w whatsmeowService) startInstance(instanceId string, options *startOptions
 	return nil
 }
 
-func (w whatsmeowService) ConnectOnStartup(clientName string) {
+func (w *whatsmeowService) ConnectOnStartup(clientName string) {
 	w.loggerWrapper.GetLogger(clientName).LogInfo("Connecting all instances on startup")
 	var instances []*instance_model.Instance
 	var err error

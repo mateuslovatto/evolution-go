@@ -56,6 +56,8 @@ type instances struct {
 	loggerWrapper      *logger_wrapper.LoggerManager
 }
 
+var ErrInstanceAlreadyAuthenticated = errors.New("instance is already authenticated; disconnect the device before pairing again")
+
 type ProxyConfig struct {
 	Protocol string `json:"protocol,omitempty"`
 	Port     string `json:"port"`
@@ -280,17 +282,14 @@ func (i instances) Connect(data *ConnectStruct, instance *instance_model.Instanc
 			IsProxy:       false,
 		}
 
-		if instance.Proxy != "" || i.config.ProxyHost != "" {
-			var proxyConfig ProxyConfig
-			err := json.Unmarshal([]byte(instance.Proxy), &proxyConfig)
-			if err != nil {
-				i.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error unmarshalling proxy config: %v", instance.Id, err)
-				return nil, "", "", err
-			}
-
-			if proxyConfig.Host != "" || i.config.ProxyHost != "" {
-				clientData.IsProxy = true
-			}
+		if whatsmeow_service.HasConfiguredProxy(
+			instance.Proxy,
+			i.config.ProxyHost,
+			i.config.ProxyPort,
+			i.config.ProxyUsername,
+			i.config.ProxyPassword,
+		) {
+			clientData.IsProxy = true
 		}
 
 		go i.whatsmeowService.StartClient(clientData)
@@ -532,7 +531,7 @@ func (i instances) Pair(data *PairStruct, instance *instance_model.Instance) (*P
 
 	// Logged session: pair must never start a client or re-pair.
 	if client != nil && client.IsLoggedIn() {
-		return nil, fmt.Errorf("instance is already authenticated")
+		return nil, ErrInstanceAlreadyAuthenticated
 	}
 
 	if client == nil || !client.IsConnected() {
@@ -551,7 +550,7 @@ func (i instances) Pair(data *PairStruct, instance *instance_model.Instance) (*P
 	}
 
 	if client.IsLoggedIn() {
-		return nil, fmt.Errorf("instance is already authenticated")
+		return nil, ErrInstanceAlreadyAuthenticated
 	}
 
 	code, err := client.PairPhone(context.Background(), data.Phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
@@ -759,17 +758,14 @@ func (i instances) ForceReconnect(instanceId string, number string) error {
 		IsProxy:       false,
 	}
 
-	if instance.Proxy != "" || i.config.ProxyHost != "" {
-		var proxyConfig ProxyConfig
-		err := json.Unmarshal([]byte(instance.Proxy), &proxyConfig)
-		if err != nil {
-			i.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error unmarshalling proxy config: %v", instance.Id, err)
-			return err
-		}
-
-		if proxyConfig.Host != "" || i.config.ProxyHost != "" {
-			clientData.IsProxy = true
-		}
+	if whatsmeow_service.HasConfiguredProxy(
+		instance.Proxy,
+		i.config.ProxyHost,
+		i.config.ProxyPort,
+		i.config.ProxyUsername,
+		i.config.ProxyPassword,
+	) {
+		clientData.IsProxy = true
 	}
 
 	if i.clientPointer[instance.Id] != nil {
