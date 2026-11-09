@@ -1,6 +1,7 @@
 package instance_handler
 
 import (
+	"errors"
 	"net/http"
 	"time"
 
@@ -445,6 +446,10 @@ func (i *instanceHandler) SetProxy(ctx *gin.Context) {
 
 	err = i.instanceService.SetProxyFromStruct(instanceId, data)
 	if err != nil {
+		if errors.Is(err, utils.ErrSocks4Unsupported) {
+			ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
