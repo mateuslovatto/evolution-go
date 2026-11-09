@@ -56,6 +56,8 @@ type instances struct {
 	loggerWrapper      *logger_wrapper.LoggerManager
 }
 
+var ErrInstanceAlreadyAuthenticated = errors.New("instance is already authenticated; disconnect the device before pairing again")
+
 type ProxyConfig struct {
 	Protocol string `json:"protocol,omitempty"`
 	Port     string `json:"port"`
@@ -164,6 +166,9 @@ func (i *instances) ensureClientConnected(instanceId string) (*whatsmeow.Client,
 
 func (i instances) Create(data *CreateStruct) (*instance_model.Instance, error) {
 	if data.Proxy != nil {
+		if err := utils.ValidateProxyProtocol(data.Proxy.Protocol); err != nil {
+			return nil, err
+		}
 		data.Proxy.Protocol = utils.NormalizeProxyProtocol(data.Proxy.Protocol, data.Proxy.Port)
 	}
 
@@ -244,6 +249,16 @@ func (i instances) Connect(data *ConnectStruct, instance *instance_model.Instanc
 	// Verifica se a instância já está rodando
 	isInstanceRunning := i.clientPointer[instance.Id] != nil
 
+	// A logged session owns the instance: never call StartClient (which would
+	// replace the live client with a second one). Only sync runtime settings.
+	if client := i.clientPointer[instance.Id]; client != nil && client.IsLoggedIn() {
+		if err := i.whatsmeowService.UpdateInstanceSettings(instance.Id); err != nil {
+			i.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Instance settings kept for later: %v", instance.Id, err)
+		}
+		i.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Client is logged in; connect will not start another client", instance.Id)
+		return instance, instance.Jid, eventString, nil
+	}
+
 	// Sincroniza as configurações na instância em execução (se já estiver conectada)
 	err = i.whatsmeowService.UpdateInstanceSettings(instance.Id)
 	if err != nil {
@@ -267,17 +282,14 @@ func (i instances) Connect(data *ConnectStruct, instance *instance_model.Instanc
 			IsProxy:       false,
 		}
 
-		if instance.Proxy != "" || i.config.ProxyHost != "" {
-			var proxyConfig ProxyConfig
-			err := json.Unmarshal([]byte(instance.Proxy), &proxyConfig)
-			if err != nil {
-				i.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error unmarshalling proxy config: %v", instance.Id, err)
-				return nil, "", "", err
-			}
-
-			if proxyConfig.Host != "" || i.config.ProxyHost != "" {
-				clientData.IsProxy = true
-			}
+		if whatsmeow_service.HasConfiguredProxy(
+			instance.Proxy,
+			i.config.ProxyHost,
+			i.config.ProxyPort,
+			i.config.ProxyUsername,
+			i.config.ProxyPassword,
+		) {
+			clientData.IsProxy = true
 		}
 
 		go i.whatsmeowService.StartClient(clientData)
@@ -335,6 +347,7 @@ func (i instances) Disconnect(instance *instance_model.Instance) (*instance_mode
 }
 
 func (i instances) Logout(instance *instance_model.Instance) (*instance_model.Instance, error) {
+	i.whatsmeowService.CancelProxyRetry(instance.Id)
 	client, err := i.ensureClientConnected(instance.Id)
 	if err != nil {
 		return instance, err
@@ -415,13 +428,16 @@ func (i instances) GetQr(instance *instance_model.Instance) (*QrcodeStruct, erro
 	logger := i.loggerWrapper.GetLogger(instance.Id)
 	client := i.clientPointer[instance.Id]
 
-	// Se não há cliente ou o cliente está logado, precisamos iniciar um novo cliente
-	if client == nil || client.IsLoggedIn() {
-		if client != nil && client.IsLoggedIn() {
-			logger.LogInfo("[%s] Client is logged in, starting new instance for QR code", instance.Id)
-		} else {
-			logger.LogInfo("[%s] No client found, starting new instance for QR code", instance.Id)
-		}
+	// A logged session owns the instance. QR/pair must never call StartInstance
+	// with it: that replaces the live client (incident fix/rotas-sbx-sem-start).
+	if client != nil && client.IsLoggedIn() {
+		logger.LogInfo("[%s] Client is logged in; not starting another instance for QR", instance.Id)
+		return nil, fmt.Errorf("session already logged in")
+	}
+
+	// Só inicia o pareamento quando NÃO há sessão logada.
+	if client == nil {
+		logger.LogInfo("[%s] No client found, starting new instance for QR code", instance.Id)
 
 		// Iniciar nova instância para gerar QR code
 		err := i.whatsmeowService.StartInstance(instance.Id)
@@ -513,10 +529,12 @@ func (i instances) Pair(data *PairStruct, instance *instance_model.Instance) (*P
 	logger := i.loggerWrapper.GetLogger(instance.Id)
 	client := i.clientPointer[instance.Id]
 
+	// Logged session: pair must never start a client or re-pair.
+	if client != nil && client.IsLoggedIn() {
+		return nil, ErrInstanceAlreadyAuthenticated
+	}
+
 	if client == nil || !client.IsConnected() {
-		if client != nil && client.IsLoggedIn() {
-			return nil, fmt.Errorf("instance is already authenticated")
-		}
 		logger.LogInfo("[%s] No active connection, starting instance for phone pairing", instance.Id)
 		if err := i.whatsmeowService.StartInstance(instance.Id); err != nil {
 			logger.LogError("[%s] Failed to start instance for pairing: %v", instance.Id, err)
@@ -532,7 +550,7 @@ func (i instances) Pair(data *PairStruct, instance *instance_model.Instance) (*P
 	}
 
 	if client.IsLoggedIn() {
-		return nil, fmt.Errorf("instance is already authenticated")
+		return nil, ErrInstanceAlreadyAuthenticated
 	}
 
 	code, err := client.PairPhone(context.Background(), data.Phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
@@ -582,6 +600,7 @@ func (i instances) Info(instanceId string) (*instance_model.Instance, error) {
 }
 
 func (i instances) Delete(id string) error {
+	i.whatsmeowService.CancelProxyRetry(id)
 	instance, err := i.instanceRepository.GetInstanceByID(id)
 	if err != nil {
 		return err
@@ -634,6 +653,10 @@ func (i instances) SetProxy(id string, proxyConfig *ProxyConfig) error {
 		return fmt.Errorf("proxy port is required")
 	}
 
+	if err := utils.ValidateProxyProtocol(proxyConfig.Protocol); err != nil {
+		return err
+	}
+
 	proxyConfig.Protocol = utils.NormalizeProxyProtocol(proxyConfig.Protocol, proxyConfig.Port)
 
 	// Convert proxy config to JSON
@@ -654,8 +677,15 @@ func (i instances) SetProxy(id string, proxyConfig *ProxyConfig) error {
 
 	i.loggerWrapper.GetLogger(id).LogInfo("[%s] Proxy configuration updated: %s://%s:%s", id, proxyConfig.Protocol, proxyConfig.Host, proxyConfig.Port)
 
-	// Reconnect to apply proxy changes
-	go i.Reconnect(instance)
+	// Reconnect through the new proxy without pairing again. Do not call Reconnect
+	// (it requires an already connected client); ReconnectClient clears the old
+	// client and StartInstance reads the proxy just saved in the database.
+	i.whatsmeowService.CancelProxyRetry(instance.Id)
+	go func() {
+		if err := i.whatsmeowService.ReconnectClient(instance.Id); err != nil {
+			i.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Failed to reconnect after proxy update: %v", instance.Id, err)
+		}
+	}()
 
 	return nil
 }
@@ -691,7 +721,13 @@ func (i instances) RemoveProxy(id string) error {
 
 	i.loggerWrapper.GetLogger(id).LogInfo("[%s] Proxy configuration removed", id)
 
-	go i.Reconnect(instance)
+	// Explicit operator intent: reconnect direct (no proxy) without pairing.
+	i.whatsmeowService.CancelProxyRetry(instance.Id)
+	go func() {
+		if err := i.whatsmeowService.ReconnectClient(instance.Id); err != nil {
+			i.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Failed to reconnect after proxy removal: %v", instance.Id, err)
+		}
+	}()
 
 	return nil
 }
@@ -722,17 +758,14 @@ func (i instances) ForceReconnect(instanceId string, number string) error {
 		IsProxy:       false,
 	}
 
-	if instance.Proxy != "" || i.config.ProxyHost != "" {
-		var proxyConfig ProxyConfig
-		err := json.Unmarshal([]byte(instance.Proxy), &proxyConfig)
-		if err != nil {
-			i.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error unmarshalling proxy config: %v", instance.Id, err)
-			return err
-		}
-
-		if proxyConfig.Host != "" || i.config.ProxyHost != "" {
-			clientData.IsProxy = true
-		}
+	if whatsmeow_service.HasConfiguredProxy(
+		instance.Proxy,
+		i.config.ProxyHost,
+		i.config.ProxyPort,
+		i.config.ProxyUsername,
+		i.config.ProxyPassword,
+	) {
+		clientData.IsProxy = true
 	}
 
 	if i.clientPointer[instance.Id] != nil {

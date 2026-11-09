@@ -1,6 +1,7 @@
 package instance_handler
 
 import (
+	"errors"
 	"net/http"
 	"time"
 
@@ -99,6 +100,10 @@ func (i *instanceHandler) Create(ctx *gin.Context) {
 
 	createdInstance, err := i.instanceService.Create(data)
 	if err != nil {
+		if errors.Is(err, utils.ErrSocks4Unsupported) {
+			ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -323,6 +328,10 @@ func (i *instanceHandler) Pair(ctx *gin.Context) {
 
 	pairingCode, err := i.instanceService.Pair(data, instance)
 	if err != nil {
+		if errors.Is(err, instance_service.ErrInstanceAlreadyAuthenticated) {
+			ctx.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -445,6 +454,10 @@ func (i *instanceHandler) SetProxy(ctx *gin.Context) {
 
 	err = i.instanceService.SetProxyFromStruct(instanceId, data)
 	if err != nil {
+		if errors.Is(err, utils.ErrSocks4Unsupported) {
+			ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}

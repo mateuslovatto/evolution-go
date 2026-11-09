@@ -269,6 +269,21 @@ func CreateSocks5Proxy(socks5Host, socks5Port, user, password string) (proxy.Dia
 	// }, nil
 }
 
+// ErrSocks4Unsupported is returned when the client asks for socks4. The fork
+// only dials http/https/socks5; an explicit 400 is better than a silent guess.
+var ErrSocks4Unsupported = fmt.Errorf("socks4 não é suportado; use socks5, http ou https")
+
+// ValidateProxyProtocol rejects protocols the fork cannot dial. Kept separate
+// from NormalizeProxyProtocol so an explicit "socks4" is a clear client error
+// instead of silently falling into the port heuristic (which would pretend it
+// is http/socks5).
+func ValidateProxyProtocol(protocol string) error {
+	if strings.EqualFold(strings.TrimSpace(protocol), "socks4") {
+		return ErrSocks4Unsupported
+	}
+	return nil
+}
+
 // NormalizeProxyProtocol returns the proxy protocol normalized to one of
 // http/https/socks5. If not supplied, it is inferred from the port — ports
 // 1080, 2080, and 42000-43000 map to socks5; everything else defaults to http.

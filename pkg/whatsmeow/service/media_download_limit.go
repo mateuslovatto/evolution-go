@@ -110,22 +110,43 @@ func (c *cappedReadCloser) Close() error {
 func mediaHTTPClient(proxyAddress string) *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	if proxyAddress != "" {
-		if parsed, err := url.Parse(proxyAddress); err == nil {
-			switch parsed.Scheme {
-			case "http", "https":
-				transport.Proxy = http.ProxyURL(parsed)
-			case "socks5":
-				dialer, err := proxy.FromURL(parsed, &net.Dialer{
-					Timeout:   30 * time.Second,
-					KeepAlive: 30 * time.Second,
-				})
-				if err == nil {
-					if contextDialer, ok := dialer.(proxy.ContextDialer); ok {
-						transport.DialContext = contextDialer.DialContext
-					}
-				}
+		parsed, err := url.Parse(proxyAddress)
+		if err != nil {
+			return failClosedMediaClient(fmt.Errorf("invalid media proxy: %w", err))
+		}
+		switch parsed.Scheme {
+		case "http", "https":
+			transport.Proxy = http.ProxyURL(parsed)
+		case "socks5":
+			dialer, err := proxy.FromURL(parsed, &net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			})
+			if err != nil {
+				return failClosedMediaClient(fmt.Errorf("invalid media proxy: %w", err))
 			}
+			contextDialer, ok := dialer.(proxy.ContextDialer)
+			if !ok {
+				return failClosedMediaClient(errors.New("media proxy does not support context dialing"))
+			}
+			transport.DialContext = contextDialer.DialContext
+		default:
+			return failClosedMediaClient(fmt.Errorf("unsupported media proxy scheme %q", parsed.Scheme))
 		}
 	}
 	return &http.Client{Transport: mediaLimitTransport{base: transport}}
+}
+
+// failClosedMediaClient never dials direct: a proxy that cannot be built makes
+// every media request fail instead of silently using the server IP.
+func failClosedMediaClient(err error) *http.Client {
+	return &http.Client{Transport: mediaLimitTransport{base: failingRoundTripper{err: err}}}
+}
+
+type failingRoundTripper struct {
+	err error
+}
+
+func (f failingRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, f.err
 }
