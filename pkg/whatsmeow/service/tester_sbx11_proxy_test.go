@@ -3,6 +3,7 @@ package whatsmeow_service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -120,13 +121,18 @@ var _ producer_interfaces.Producer = (*producerSpy)(nil)
 
 type reconnectSpy struct {
 	WhatsmeowService
-	calls int
+	calls   int
+	retries int
 }
 
 func (s *reconnectSpy) ReconnectClient(string) error {
 	s.calls++
 	return nil
 }
+
+func (s *reconnectSpy) StartProxyRetry(string) { s.retries++ }
+
+func (s *reconnectSpy) CancelProxyRetry(string) {}
 
 func newTestService(repo *repoSpy, producer *producerSpy) whatsmeowService {
 	return whatsmeowService{
@@ -178,7 +184,7 @@ func TestStrictProxyStartFailsClosed(t *testing.T) {
 	service.myClientPointer[instance.Id] = &MyClient{}
 	cd := &ClientData{Instance: instance, IsProxy: true}
 
-	if service.connectStrict(cd, client, true) {
+	if err := service.connectStrict(cd, client, true); err == nil {
 		t.Fatal("connectStrict devolveu conectado; proxy recusou a autenticação")
 	}
 
@@ -338,6 +344,9 @@ func TestMidSessionProxyDropEmitsFast(t *testing.T) {
 	if restarts.calls != 0 {
 		t.Fatalf("proxy caiu e o fork reiniciou sozinho (%d)", restarts.calls)
 	}
+	if restarts.retries != 1 {
+		t.Fatalf("ciclo de reconexão agendado %d vez(es)", restarts.retries)
+	}
 }
 
 func TestReconnectClientThroughNewProxy(t *testing.T) {
@@ -386,13 +395,13 @@ func TestReconnectClientThroughNewProxy(t *testing.T) {
 
 	connected := make(chan time.Time, 1)
 	proxySeen := make(chan string, 1)
-	service.connector = func(cd *ClientData, _ *whatsmeow.Client, proxyConfigured bool) bool {
+	service.connector = func(cd *ClientData, _ *whatsmeow.Client, proxyConfigured bool) error {
 		if !proxyConfigured {
 			t.Error("reconexão não usou o proxy novo")
 		}
 		proxySeen <- cd.Instance.Proxy
 		connected <- time.Now()
-		return true // dialer falso: handshake simulado, nada vai para o WhatsApp
+		return nil // dialer falso: handshake simulado, nada vai para o WhatsApp
 	}
 
 	startedAt := time.Now()
@@ -421,6 +430,159 @@ func TestReconnectClientThroughNewProxy(t *testing.T) {
 		t.Fatal("dialer falso não recebeu o proxy")
 	}
 	_ = repo
+}
+
+func TestProxyRetryReconnectsSameProxy(t *testing.T) {
+	container, err := sqlstore.New(
+		context.Background(),
+		"sqlite",
+		"file:"+filepath.Join(t.TempDir(), "retry.sqlite")+"?_pragma=foreign_keys(1)",
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("sqlstore: %v", err)
+	}
+	t.Cleanup(func() { _ = container.Close() })
+
+	repo := &repoSpy{}
+	repo.instance = &instance_model.Instance{
+		Id:      "inst-retry",
+		Token:   "token-retry",
+		Name:    "Retry QA",
+		Jid:     "5511999999999@s.whatsapp.net",
+		Events:  "ALL",
+		Webhook: "http://127.0.0.1:1/hook",
+		Proxy:   `{"protocol":"socks5","host":"127.0.0.1","port":"1080"}`,
+	}
+	producer := &producerSpy{ch: make(chan []byte, 4)}
+	service := &whatsmeowService{
+		instanceRepository: repo,
+		config: &config.Config{
+			LogDirectory:         os.TempDir(),
+			WhatsappVersionMajor: 2,
+			WhatsappVersionMinor: 3000,
+			WhatsappVersionPatch: 1,
+		},
+		clientPointer:     map[string]*whatsmeow.Client{},
+		myClientPointer:   map[string]*MyClient{},
+		killChannel:       map[string](chan bool){},
+		userInfoCache:     cache.New(cache.NoExpiration, 0),
+		loggerWrapper:     logger_wrapper.NewLoggerManager(&config.Config{LogDirectory: os.TempDir()}),
+		webhookProducer:   producer,
+		storeContainer:    &storeContainerHolder{container: container},
+		proxyRetryBackoff: []time.Duration{10 * time.Millisecond, 20 * time.Millisecond},
+	}
+	attempts := 0
+	connected := make(chan struct{}, 1)
+	service.connector = func(cd *ClientData, _ *whatsmeow.Client, configured bool) error {
+		attempts++
+		if !configured || !strings.Contains(cd.Instance.Proxy, `"host":"127.0.0.1"`) {
+			t.Error("retry não usou o mesmo proxy")
+		}
+		if attempts == 1 {
+			return errors.New("proxy down")
+		}
+		connected <- struct{}{}
+		return nil
+	}
+
+	service.StartProxyRetry(repo.instance.Id)
+
+	select {
+	case <-connected:
+	case <-time.After(3 * time.Second):
+		t.Fatal("retry não reconectou pelo mesmo proxy")
+	}
+	if attempts != 2 {
+		t.Fatalf("tentativas = %d, quer 2 (uma falha + uma ok)", attempts)
+	}
+	select {
+	case payload := <-producer.ch:
+		if !strings.Contains(string(payload), `"event":"Connected"`) {
+			t.Fatalf("evento de religação inesperado: %s", payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("evento Connected não foi emitido na religação")
+	}
+	state := service.proxyRegistry()
+	state.mu.Lock()
+	pending := len(state.cycles)
+	state.mu.Unlock()
+	if pending != 0 {
+		t.Fatalf("ciclo ficou aberto após conectar (%d)", pending)
+	}
+}
+
+func TestProxyRetryCanceled(t *testing.T) {
+	repo := &repoSpy{}
+	repo.instance = &instance_model.Instance{
+		Id:    "inst-retry-cancel",
+		Jid:   "5511999999999@s.whatsapp.net",
+		Proxy: `{"protocol":"socks5","host":"127.0.0.1","port":"1080"}`,
+	}
+	service := &whatsmeowService{
+		instanceRepository: repo,
+		config:             &config.Config{LogDirectory: os.TempDir()},
+		clientPointer:      map[string]*whatsmeow.Client{},
+		myClientPointer:    map[string]*MyClient{},
+		killChannel:        map[string](chan bool){},
+		userInfoCache:      cache.New(cache.NoExpiration, 0),
+		loggerWrapper:      logger_wrapper.NewLoggerManager(&config.Config{LogDirectory: os.TempDir()}),
+		proxyRetryBackoff:  []time.Duration{200 * time.Millisecond},
+	}
+	attempts := 0
+	service.connector = func(*ClientData, *whatsmeow.Client, bool) error {
+		attempts++
+		return errors.New("não deveria tentar")
+	}
+
+	service.StartProxyRetry(repo.instance.Id)
+	time.Sleep(50 * time.Millisecond)
+	service.CancelProxyRetry(repo.instance.Id)
+	time.Sleep(300 * time.Millisecond)
+
+	if attempts != 0 {
+		t.Fatalf("ciclo cancelado ainda tentou %d vez(es)", attempts)
+	}
+	state := service.proxyRegistry()
+	state.mu.Lock()
+	pending := len(state.cycles)
+	state.mu.Unlock()
+	if pending != 0 {
+		t.Fatalf("ciclo cancelado continuou no mapa (%d)", pending)
+	}
+}
+
+func TestProxyRetrySingleCyclePerInstance(t *testing.T) {
+	repo := &repoSpy{}
+	repo.instance = &instance_model.Instance{
+		Id:    "inst-retry-single",
+		Jid:   "5511999999999@s.whatsapp.net",
+		Proxy: `{"protocol":"socks5","host":"127.0.0.1","port":"1080"}`,
+	}
+	service := &whatsmeowService{
+		instanceRepository: repo,
+		config:             &config.Config{LogDirectory: os.TempDir()},
+		clientPointer:      map[string]*whatsmeow.Client{},
+		myClientPointer:    map[string]*MyClient{},
+		killChannel:        map[string](chan bool){},
+		userInfoCache:      cache.New(cache.NoExpiration, 0),
+		loggerWrapper:      logger_wrapper.NewLoggerManager(&config.Config{LogDirectory: os.TempDir()}),
+		proxyRetryBackoff:  []time.Duration{time.Hour},
+	}
+
+	service.StartProxyRetry(repo.instance.Id)
+	service.StartProxyRetry(repo.instance.Id)
+	service.StartProxyRetry(repo.instance.Id)
+
+	state := service.proxyRegistry()
+	state.mu.Lock()
+	pending := len(state.cycles)
+	state.mu.Unlock()
+	if pending != 1 {
+		t.Fatalf("ciclos abertos = %d, quer 1", pending)
+	}
+	service.CancelProxyRetry(repo.instance.Id)
 }
 
 func TestApplyProxySetupErrorStaysStrict(t *testing.T) {

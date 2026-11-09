@@ -24,9 +24,16 @@ type whatsmeowSpy struct {
 	whatsmeow_service.WhatsmeowService
 	starts       int
 	updates      int
+	cancels      int
 	startClients chan struct{}
 	reconnects   chan string
 }
+
+func (s *whatsmeowSpy) StartProxyRetry(string) {}
+
+func (s *whatsmeowSpy) CancelProxyRetry(string) { s.cancels++ }
+
+func (s *whatsmeowSpy) ClearInstanceCache(string, string) error { return nil }
 
 func (s *whatsmeowSpy) ReconnectClient(instanceId string) error {
 	if s.reconnects != nil {
@@ -72,6 +79,8 @@ func (r *instanceRepoSpy) GetInstanceByID(string) (*instance_model.Instance, err
 	r.gets++
 	return r.instance, nil
 }
+
+func (r *instanceRepoSpy) Delete(string) error { return nil }
 
 // markLoggedIn sets whatsmeow's private isLoggedIn flag. It is test-only: the
 // public IsLoggedIn reads the atomic and there is no setter, and this suite
@@ -228,6 +237,9 @@ func TestSetProxyReconectaSemQr(t *testing.T) {
 	if spy.starts != 0 {
 		t.Fatalf("SetProxy passou por StartInstance/QR %d vez(es)", spy.starts)
 	}
+	if spy.cancels != 1 {
+		t.Fatalf("SetProxy não cancelou o ciclo antigo (%d)", spy.cancels)
+	}
 	if !strings.Contains(repo.instance.Proxy, `"protocol":"socks5"`) ||
 		!strings.Contains(repo.instance.Proxy, `"host":"127.0.0.1"`) {
 		t.Fatalf("proxy salvo = %s", repo.instance.Proxy)
@@ -255,6 +267,35 @@ func TestRemoveProxyReconectaDireto(t *testing.T) {
 	}
 	if repo.instance.Proxy != "" {
 		t.Fatalf("proxy não removido: %q", repo.instance.Proxy)
+	}
+	if spy.cancels != 1 {
+		t.Fatalf("RemoveProxy não cancelou o ciclo (%d)", spy.cancels)
+	}
+}
+
+func TestLogoutCancelaCiclo(t *testing.T) {
+	instance := &instance_model.Instance{Id: "logout-cancel", Events: "ALL"}
+	spy := &whatsmeowSpy{}
+	repo := &instanceRepoSpy{instance: instance}
+	svc := newTestInstances(spy, repo, map[string]*whatsmeow.Client{})
+
+	_, _ = svc.Logout(instance)
+	if spy.cancels != 1 {
+		t.Fatalf("Logout não cancelou o ciclo (%d)", spy.cancels)
+	}
+}
+
+func TestDeleteCancelaCiclo(t *testing.T) {
+	instance := &instance_model.Instance{Id: "delete-cancel", Events: "ALL"}
+	spy := &whatsmeowSpy{}
+	repo := &instanceRepoSpy{instance: instance}
+	svc := newTestInstances(spy, repo, map[string]*whatsmeow.Client{})
+
+	if err := svc.Delete(instance.Id); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if spy.cancels != 1 {
+		t.Fatalf("Delete não cancelou o ciclo (%d)", spy.cancels)
 	}
 }
 

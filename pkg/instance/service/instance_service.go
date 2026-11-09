@@ -348,6 +348,7 @@ func (i instances) Disconnect(instance *instance_model.Instance) (*instance_mode
 }
 
 func (i instances) Logout(instance *instance_model.Instance) (*instance_model.Instance, error) {
+	i.whatsmeowService.CancelProxyRetry(instance.Id)
 	client, err := i.ensureClientConnected(instance.Id)
 	if err != nil {
 		return instance, err
@@ -600,6 +601,7 @@ func (i instances) Info(instanceId string) (*instance_model.Instance, error) {
 }
 
 func (i instances) Delete(id string) error {
+	i.whatsmeowService.CancelProxyRetry(id)
 	instance, err := i.instanceRepository.GetInstanceByID(id)
 	if err != nil {
 		return err
@@ -679,6 +681,7 @@ func (i instances) SetProxy(id string, proxyConfig *ProxyConfig) error {
 	// Reconnect through the new proxy without pairing again. Do not call Reconnect
 	// (it requires an already connected client); ReconnectClient clears the old
 	// client and StartInstance reads the proxy just saved in the database.
+	i.whatsmeowService.CancelProxyRetry(instance.Id)
 	go func() {
 		if err := i.whatsmeowService.ReconnectClient(instance.Id); err != nil {
 			i.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Failed to reconnect after proxy update: %v", instance.Id, err)
@@ -720,6 +723,7 @@ func (i instances) RemoveProxy(id string) error {
 	i.loggerWrapper.GetLogger(id).LogInfo("[%s] Proxy configuration removed", id)
 
 	// Explicit operator intent: reconnect direct (no proxy) without pairing.
+	i.whatsmeowService.CancelProxyRetry(instance.Id)
 	go func() {
 		if err := i.whatsmeowService.ReconnectClient(instance.Id); err != nil {
 			i.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Failed to reconnect after proxy removal: %v", instance.Id, err)
