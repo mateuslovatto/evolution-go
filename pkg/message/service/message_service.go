@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	config "github.com/evolution-foundation/evolution-go/pkg/config"
@@ -260,12 +261,33 @@ func (m *messageService) ChatPresence(data *ChatPresenceStruct, instance *instan
 	// presence handling (events.AppStateSyncComplete) may have set us to
 	// Unavailable, in which case the server silently drops the typing
 	// indicator. Mark ourselves available first to guarantee delivery.
+	//
+	// When alwaysOnline is false the device must not stay available (WhatsApp
+	// would then suppress push notifications on the user's phone), so a
+	// debounced restore to Unavailable is scheduled once the chatstate is done
+	// (see scheduleUnavailableRestore below). Cancel any pending restore now so
+	// it cannot fire in the middle of this indicator.
+	if !instance.AlwaysOnline {
+		cancelUnavailableRestore(instance.Id)
+	}
 	if presErr := client.SendPresence(context.Background(), types.PresenceAvailable); presErr != nil {
 		m.loggerWrapper.GetLogger(instance.Id).LogWarn("[%s] SendPresence(available) before chatstate failed (non-fatal): %v", instance.Id, presErr)
 	}
 
 	state := types.ChatPresence(data.State)
 	mediaType := types.ChatPresenceMedia(media)
+
+	// Composing/recording without a Delay is a single fire: keep the device
+	// available long enough for the indicator to show before restoring
+	// Unavailable. In every other case the indicator is finished (paused, or
+	// the Delay loop below sends paused) and a short grace period is enough.
+	restoreAfter := presenceRestoreShortGrace
+	if data.Delay <= 0 && state != types.ChatPresencePaused {
+		restoreAfter = presenceRestoreIndicatorGrace
+	}
+	if !instance.AlwaysOnline {
+		defer m.scheduleUnavailableRestore(client, instance.Id, restoreAfter)
+	}
 
 	err = client.SendChatPresence(context.Background(), recipient, state, mediaType)
 	if err != nil {
@@ -309,6 +331,60 @@ func (m *messageService) ChatPresence(data *ChatPresenceStruct, instance *instan
 	m.loggerWrapper.GetLogger(instance.Id).LogInfo("Presence (%s) sent to %s", data.State, data.Number)
 
 	return ts.String(), nil
+}
+
+const (
+	// presenceRestoreShortGrace is used once the chatstate has been cleared
+	// (paused sent); presenceRestoreIndicatorGrace keeps a single-fire
+	// composing/recording indicator visible before going Unavailable.
+	presenceRestoreShortGrace     = 3 * time.Second
+	presenceRestoreIndicatorGrace = 20 * time.Second
+)
+
+// pendingUnavailable holds one debounced "restore Unavailable" timer per
+// instance, so consecutive /message/presence calls keep the device available
+// only while they last.
+var pendingUnavailable = struct {
+	sync.Mutex
+	timers map[string]*time.Timer
+}{timers: make(map[string]*time.Timer)}
+
+func cancelUnavailableRestore(instanceID string) {
+	pendingUnavailable.Lock()
+	defer pendingUnavailable.Unlock()
+	if t, ok := pendingUnavailable.timers[instanceID]; ok {
+		t.Stop()
+		delete(pendingUnavailable.timers, instanceID)
+	}
+}
+
+// scheduleUnavailableRestore marks the device Unavailable again after d,
+// unless another presence call reschedules it first. Used for instances with
+// alwaysOnline=false, which must not remain permanently available.
+func (m *messageService) scheduleUnavailableRestore(client *whatsmeow.Client, instanceID string, d time.Duration) {
+	pendingUnavailable.Lock()
+	defer pendingUnavailable.Unlock()
+	if t, ok := pendingUnavailable.timers[instanceID]; ok {
+		t.Stop()
+	}
+	var timer *time.Timer
+	timer = time.AfterFunc(d, func() {
+		pendingUnavailable.Lock()
+		if pendingUnavailable.timers[instanceID] != timer {
+			pendingUnavailable.Unlock()
+			return // superseded by a newer presence call
+		}
+		delete(pendingUnavailable.timers, instanceID)
+		pendingUnavailable.Unlock()
+
+		if client == nil || !client.IsConnected() {
+			return
+		}
+		if err := client.SendPresence(context.Background(), types.PresenceUnavailable); err != nil {
+			m.loggerWrapper.GetLogger(instanceID).LogWarn("[%s] Restoring unavailable presence after chatstate failed (non-fatal): %v", instanceID, err)
+		}
+	})
+	pendingUnavailable.timers[instanceID] = timer
 }
 
 func (m *messageService) MarkRead(data *MarkReadStruct, instance *instance_model.Instance) (string, error) {
