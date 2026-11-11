@@ -175,6 +175,13 @@ type MyClient struct {
 	// signalKill stops waiting on it, never on the rotation's stop channel
 	// (which Disconnected/PairSuccess/LoggedOut also close).
 	killStarted chan struct{}
+	// relogin carries reconnect requests for this same client (515 stream
+	// restart after pairing, undecryptable 66/67) to StartClient's loop. The
+	// loop is serialized with the kill branch and reconnects only while this
+	// client owns the instance and is not being stopped. Nothing else may
+	// reconnect a client: whatsmeow's own 515 reconnect is disabled
+	// (DisableLoginAutoReconnect) and EnableAutoReconnect is off.
+	relogin chan struct{}
 
 	// QR pairing lifecycle, guarded by qrMu (written by the rotation
 	// goroutine, the event dispatch and StartClient's kill branch). The
@@ -192,6 +199,10 @@ type MyClient struct {
 	qrEndReason string        // DisconnectReason recorded when pairing ended (may be empty)
 	qrPaired    bool          // PairSuccess handled before pairing ended
 	killClaimed bool          // kill branch claimed the client (killStarted closed)
+	// reloginPending: a relogin is queued or running. The socket close it
+	// causes (or that preceded it, e.g. the server closing after a 515) is
+	// expected and must not trigger the Disconnected recovery paths.
+	reloginPending bool
 }
 
 func (mycli *MyClient) persistMessageAsync(message message_model.Message) {
@@ -887,6 +898,13 @@ func (w *whatsmeowService) StartClient(cd *ClientData) {
 	client.SetMediaHTTPClient(mediaHTTPClient(mediaProxy))
 
 	client.EnableAutoReconnect = false
+	// The 515 stream restart (normal end of a pairing) must not reconnect on
+	// its own: whatsmeow would do it from its own goroutine even after the
+	// kill branch decided to stop this client, leaving a logged session alive
+	// outside the maps (lost messages, StreamReplaced). It dispatches
+	// events.ManualLoginReconnect instead, and StartClient's loop reconnects
+	// this client only while it still owns the instance (reloginAfterRestart).
+	client.DisableLoginAutoReconnect = true
 	client.AutoTrustIdentity = true
 
 	mycli := &MyClient{
@@ -922,6 +940,7 @@ func (w *whatsmeowService) StartClient(cd *ClientData) {
 		isProxy:            cd.IsProxy,
 		killCh:             w.killChannel[cd.Instance.Id],
 		killStarted:        make(chan struct{}),
+		relogin:            make(chan struct{}, 1),
 	}
 
 	mycli.eventHandlerID = mycli.WAClient.AddEventHandler(mycli.myEventHandler)
@@ -1058,10 +1077,95 @@ func (w *whatsmeowService) StartClient(cd *ClientData) {
 			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Restarting client", cd.Instance.Id)
 			w.StartClient(cd)
 			return
+		case <-mycli.relogin:
+			// Reconnect request for this same client (515 after pairing,
+			// undecryptable 66/67). Handled here, serialized with the kill
+			// branch above, so a client being stopped never comes back.
+			if !w.reloginAfterRestart(cd, mycli, client, connect, proxyConfigured) {
+				return
+			}
 		default:
 			time.Sleep(1000 * time.Millisecond)
 		}
 	}
+}
+
+// reloginAfterRestart reconnects this same client after a stream restart (515
+// at the end of a pairing: 515 → reconnect → Connected; or the undecryptable
+// 66/67 recovery). It runs in StartClient's goroutine, serialized with the
+// kill branch, so a client the kill branch stopped — or whose session WhatsApp
+// ended (sessionEnded) — can never come back, and it only proceeds while this
+// client still owns the instance in the maps. The
+// same *whatsmeow.Client and the same connect function are reused: the proxy
+// applied by applyProxy stays on the client and connectStrict keeps the strict
+// (fail-closed) path. No new client is started (F4). Returns false when
+// StartClient must return.
+func (w *whatsmeowService) reloginAfterRestart(
+	cd *ClientData,
+	mycli *MyClient,
+	client *whatsmeow.Client,
+	connect func(*ClientData, *whatsmeow.Client, bool) error,
+	proxyConfigured bool,
+) bool {
+	id := cd.Instance.Id
+	logger := w.loggerWrapper.GetLogger(id)
+
+	// Close the old socket first: from here on it delivers no new events, so
+	// the stop check below sees the terminal events it already produced.
+	client.Disconnect()
+
+	if ok, why := mycli.beginRelogin(); !ok {
+		// The client is being stopped (pairing ended → kill on the way;
+		// LoggedOut → kill on the way; ban/stream replaced → session over).
+		// Keep the loop running, as without the request, so a pending kill
+		// is still handled.
+		logger.LogInfo("[%s] Reconnect request ignored: %s", id, why)
+		return true
+	}
+	if w.myClientPointer[id] != mycli || w.clientPointer[id] != client {
+		// Another start (ReconnectClient, proxy retry, delete) took the
+		// instance: this client is stale and must stay down.
+		mycli.endRelogin()
+		logger.LogWarn("[%s] Reconnect request ignored: client no longer owns the instance", id)
+		return false
+	}
+
+	logger.LogInfo("[%s] Stream restart: reconnecting the same client (proxy: %v)", id, proxyConfigured)
+	err := connect(cd, client, proxyConfigured)
+
+	// A terminal event already in flight when the old socket closed (whatsmeow
+	// dispatches some of them from goroutines) may have landed during the
+	// connect: never leave such a client connected, and never "recover" it.
+	if blocked, why := mycli.reloginBlocked(); blocked {
+		mycli.endRelogin()
+		logger.LogWarn("[%s] Client stopped during reconnect (%s): staying disconnected", id, why)
+		client.Disconnect()
+		// With a proxy, a failed strict connect already cleaned the maps
+		// (failProxyStart): nothing left for this loop. Otherwise keep it
+		// running for a pending kill, as above.
+		return err == nil || !proxyConfigured
+	}
+	mycli.endRelogin()
+	if err == nil {
+		return true
+	}
+
+	logger.LogError("[%s] Reconnect after stream restart failed: %v", id, err)
+	if proxyConfigured {
+		// connectStrict already ran failProxyStart (disconnected with
+		// proxy_error, maps cleaned, ConnectFailure). A paired session behind a
+		// proxy retries through the same proxy, as a mid-session drop does.
+		if client.Store.ID != nil {
+			mycli.service.StartProxyRetry(id)
+		}
+		return false
+	}
+	go func() {
+		if err := mycli.service.ReconnectClient(id); err != nil {
+			logger.LogError("[%s] Failed to restart instance after failed reconnect: %v", id, err)
+		}
+	}()
+	return false
 }
 
 func schedulePresenceUpdates(mycli *MyClient) {
@@ -1178,6 +1282,84 @@ func (mycli *MyClient) claimKill() (qrEnded bool, qrEndReason string) {
 	return mycli.qrEnded, mycli.qrEndReason
 }
 
+// reloginBlockedLocked reports why this client must not be reconnected: the
+// kill branch claimed it, its QR pairing ended, or WhatsApp ended the session
+// (sessionEnded: LoggedOut, TemporaryBan, StreamReplaced, terminal
+// ConnectFailure). Caller holds qrMu.
+func (mycli *MyClient) reloginBlockedLocked() (blocked bool, why string) {
+	switch {
+	case mycli.killClaimed:
+		return true, "kill branch owns the client"
+	case mycli.qrEnded:
+		return true, "QR pairing ended, client is being stopped"
+	case mycli.sessionEnded.Load():
+		return true, "session ended (logout, ban or stream replaced)"
+	}
+	return false, ""
+}
+
+func (mycli *MyClient) reloginBlocked() (bool, string) {
+	mycli.qrMu.Lock()
+	defer mycli.qrMu.Unlock()
+	return mycli.reloginBlockedLocked()
+}
+
+// requestRelogin queues a reconnect of this same client for StartClient's
+// loop. It is refused (false) when the client must not come back (see
+// reloginBlockedLocked) or when there is no loop to serve it. Requests
+// coalesce.
+func (mycli *MyClient) requestRelogin() bool {
+	mycli.qrMu.Lock()
+	defer mycli.qrMu.Unlock()
+	if blocked, _ := mycli.reloginBlockedLocked(); blocked || mycli.relogin == nil {
+		return false
+	}
+	mycli.reloginPending = true
+	select {
+	case mycli.relogin <- struct{}{}:
+	default: // already queued
+	}
+	return true
+}
+
+// beginRelogin is called by StartClient's loop when it picks a request up.
+// It re-checks the stop decision: the pairing may have ended, or the session
+// may have been ended by WhatsApp, after the request was queued.
+func (mycli *MyClient) beginRelogin() (ok bool, why string) {
+	mycli.qrMu.Lock()
+	defer mycli.qrMu.Unlock()
+	if blocked, why := mycli.reloginBlockedLocked(); blocked {
+		mycli.reloginPending = false
+		return false, why
+	}
+	return true, ""
+}
+
+func (mycli *MyClient) endRelogin() {
+	mycli.qrMu.Lock()
+	defer mycli.qrMu.Unlock()
+	mycli.reloginPending = false
+}
+
+// socketCloseOwned reports whether a socket close of this client is already
+// owned by someone else and must not trigger the Disconnected recovery
+// (ConnectFailure, proxy retry, ReconnectClient): the client is being stopped
+// (QR pairing ended or the kill branch claimed it), or a relogin of this same
+// client is queued/running.
+func (mycli *MyClient) socketCloseOwned() (owned bool, why string) {
+	mycli.qrMu.Lock()
+	defer mycli.qrMu.Unlock()
+	switch {
+	case mycli.killClaimed:
+		return true, "kill branch owns the client"
+	case mycli.qrEnded:
+		return true, "QR pairing ended, client is being stopped"
+	case mycli.reloginPending:
+		return true, "reconnect of this client in progress"
+	}
+	return false, ""
+}
+
 // markPaired records PairSuccess. It returns false when the pairing had
 // already been ended (teardown or socket drop won the race): the QRTimeout is
 // out and the kill branch will stop this client, so the caller must not report
@@ -1250,11 +1432,13 @@ const (
 func (mycli *MyClient) resolveProxyDrop(reason string) (proxyDropOutcome, int) {
 	mycli.qrMu.Lock()
 	defer mycli.qrMu.Unlock()
+	if mycli.qrEnded || mycli.killClaimed {
+		// Being stopped (pairing ended — even if a late PairSuccess left a
+		// device ID — or the kill branch owns it): no retry may bring it back.
+		return proxyDropOwned, mycli.qrcodeCount
+	}
 	if mycli.qrPaired || !mycli.isPairing() {
 		return proxyDropRetry, 0
-	}
-	if mycli.qrEnded || mycli.killClaimed {
-		return proxyDropOwned, mycli.qrcodeCount
 	}
 	mycli.cancelQRRotationLocked()
 	mycli.qrEnded = true
@@ -1907,6 +2091,17 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	case *events.StreamReplaced:
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Received StreamReplaced event", mycli.userID)
 		mycli.stopSession()
+		return
+	case *events.ManualLoginReconnect:
+		// 515 stream restart, normally right after PairSuccess. whatsmeow does
+		// not reconnect by itself (DisableLoginAutoReconnect): StartClient's
+		// loop reconnects this same client unless it is being stopped. Never
+		// Disconnect/Connect here: this runs inside the socket's frame handler.
+		if mycli.requestRelogin() {
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Stream restart (515): reconnect queued", mycli.userID)
+		} else {
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Stream restart (515) ignored: client is being stopped", mycli.userID)
+		}
 		return
 	case *events.TemporaryBan:
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] User received temporary ban for %s", mycli.userID, evt.Code.String())
@@ -2843,6 +3038,13 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			// follows must not schedule it again.
 			return
 		}
+		if owned, why := mycli.socketCloseOwned(); owned {
+			// No ConnectFailure/retry/ReconnectClient for a close that is
+			// expected: the kill branch stops this client, or StartClient's loop
+			// is reconnecting it (e.g. the server closes the socket after a 515).
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Disconnected ignored: %s", mycli.userID, why)
+			return
+		}
 		doWebhook = true
 
 		// Limpar cache de userInfo para esta instância (mas não para reconexão automática)
@@ -2957,10 +3159,11 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			postMap["data"] = evt
 		} else if strings.HasPrefix(evt.Info.ID, "66") || strings.HasPrefix(evt.Info.ID, "67") {
 			mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] ID 66 or 67 found, reconnecting client", mycli.userID)
-			mycli.WAClient.Disconnect()
-			err := mycli.WAClient.Connect()
-			if err != nil {
-				mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Error reconnecting client: %s", mycli.userID, err)
+			// Reconnect through StartClient's loop (same client, same strict
+			// proxy path, never once the client is being stopped) instead of
+			// Disconnect/Connect inside the event handler.
+			if !mycli.requestRelogin() {
+				mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Reconnect not queued: client is being stopped", mycli.userID)
 			}
 		} else {
 			mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] ID is not 66 or 67 or view_once, skipping", mycli.userID)
