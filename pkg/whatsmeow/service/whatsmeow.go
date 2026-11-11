@@ -158,12 +158,7 @@ type MyClient struct {
 	processedMessages  *cache.Cache
 	natsProducer       producer_interfaces.Producer
 	loggerWrapper      *logger_wrapper.LoggerManager
-	qrcodeCount        int
-	// qrExpired is set by teardownQR right before it signals the kill channel, so
-	// StartClient's kill branch can tell a QR expiry apart from other kill signals
-	// (logout, disconnect, reconnect) and skip the automatic restart.
-	qrExpired       atomic.Bool
-	passkeyCeremony *ceremony.Store
+	passkeyCeremony    *ceremony.Store
 	// isProxy is true when this session was started with a proxy. Mid-session
 	// disconnects then become proxy_error and are reported to the SBX.
 	isProxy bool
@@ -171,6 +166,20 @@ type MyClient struct {
 	// replaced or a terminal ConnectFailure). The kill branch must not restart
 	// and no proxy retry may be scheduled after it.
 	sessionEnded atomic.Bool
+
+	// killCh is this client's kill channel, captured once by StartClient so
+	// the QR rotation goroutine never reads the unsynchronized killChannel map.
+	killCh chan bool
+
+	// QR pairing state, guarded by qrMu (written by the rotation goroutine,
+	// the event dispatch and StartClient's kill branch). qrEnded replaces the
+	// sbx qrExpired flag: teardownQR sets it, and the kill branch then never
+	// restarts the client.
+	qrMu        sync.Mutex
+	qrcodeCount int
+	qrStop      chan struct{} // closed to cancel the running rotation goroutine
+	qrEnded     bool          // teardownQR ended QR pairing: do not restart the client
+	qrEndReason string        // DisconnectReason recorded by teardownQR (may be empty)
 }
 
 func (mycli *MyClient) persistMessageAsync(message message_model.Message) {
@@ -897,9 +906,9 @@ func (w *whatsmeowService) StartClient(cd *ClientData) {
 		processedMessages:  w.processedMessages,
 		natsProducer:       w.natsProducer,
 		loggerWrapper:      w.loggerWrapper,
-		qrcodeCount:        0,
 		passkeyCeremony:    w.passkeyCeremony,
 		isProxy:            cd.IsProxy,
+		killCh:             w.killChannel[cd.Instance.Id],
 	}
 
 	mycli.eventHandlerID = mycli.WAClient.AddEventHandler(mycli.myEventHandler)
@@ -938,6 +947,11 @@ func (w *whatsmeowService) StartClient(cd *ClientData) {
 		select {
 		case <-w.killChannel[cd.Instance.Id]:
 			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Received kill signal for user '%s'", cd.Instance.Id)
+			// Stop any QR rotation goroutine of this client before tearing the
+			// socket down, so it cannot publish stale codes or signal again.
+			mycli.stopQRRotation()
+			qrEnded, qrEndReason := mycli.qrPairingEnded()
+
 			client.Disconnect()
 
 			delete(w.clientPointer, cd.Instance.Id)
@@ -949,9 +963,27 @@ func (w *whatsmeowService) StartClient(cd *ClientData) {
 
 			cd.Instance.Connected = false
 
+			if qrEnded && qrEndReason != "" {
+				// Keep the reason teardownQR recorded (max-count) instead of the
+				// stale one on cd.Instance.
+				cd.Instance.DisconnectReason = qrEndReason
+			}
+
 			err := w.instanceRepository.UpdateConnected(cd.Instance.Id, cd.Instance.Connected, cd.Instance.DisconnectReason)
 			if err != nil {
 				w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Error updating instance: %s", cd.Instance.Id, err)
+			}
+
+			if qrEnded {
+				// QR pairing ended (QR timeout or max-count reached): this client
+				// will not be restarted, so detach it now. The kill channel is
+				// only removed if it is still ours (StartInstance/proxy retry may
+				// have installed a newer one); the next /instance/qr, /pair or
+				// /connect starts a fresh client via StartInstance.
+				client.RemoveEventHandler(mycli.eventHandlerID)
+				if w.killChannel[cd.Instance.Id] == mycli.killCh {
+					delete(w.killChannel, cd.Instance.Id)
+				}
 			}
 
 			postMap := make(map[string]interface{})
@@ -991,8 +1023,10 @@ func (w *whatsmeowService) StartClient(cd *ClientData) {
 			// container, leaked a Postgres pool per cycle). The next pairing
 			// attempt starts a fresh client on demand (/instance/qr, /instance/pair
 			// or /instance/connect).
-			if mycli.qrExpired.Load() {
-				w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] QR expired: client stopped until the next connect/QR request", cd.Instance.Id)
+			// qrEnded is set by teardownQR (PR #6), which replaces the sbx
+			// qrExpired flag with the same meaning.
+			if qrEnded {
+				w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] QR pairing ended: client stopped until the next connect/QR request (not restarting)", cd.Instance.Id)
 				return
 			}
 
@@ -1062,6 +1096,149 @@ func processPresenceUpdates(mycli *MyClient) {
 	}
 }
 
+// QR rotation timing (whatsmeow native): the first code lives ~60s, every
+// subsequent one ~20s. qrCodeExpiry returns how long after the batch arrived
+// code i stops being valid.
+const (
+	qrFirstCodeTTL      = 60 * time.Second
+	qrNextCodeTTL       = 20 * time.Second
+	qrCeremonyPollEvery = 2 * time.Second
+	qrKillSignalTimeout = 30 * time.Second
+)
+
+func qrCodeExpiry(i int) time.Duration {
+	return qrFirstCodeTTL + time.Duration(i)*qrNextCodeTTL
+}
+
+// beginQRRotation cancels any rotation still running for this client and
+// returns the stop channel of the new one. It returns nil when QR pairing has
+// already been ended (teardownQR) for this client, so late events.QR are
+// ignored instead of restarting the rotation.
+func (mycli *MyClient) beginQRRotation() chan struct{} {
+	mycli.qrMu.Lock()
+	defer mycli.qrMu.Unlock()
+	if mycli.qrEnded {
+		return nil
+	}
+	if mycli.qrStop != nil {
+		close(mycli.qrStop)
+	}
+	mycli.qrStop = make(chan struct{})
+	return mycli.qrStop
+}
+
+// stopQRRotation cancels the running rotation goroutine, if any. Safe to call
+// multiple times and from any goroutine.
+func (mycli *MyClient) stopQRRotation() {
+	mycli.qrMu.Lock()
+	defer mycli.qrMu.Unlock()
+	if mycli.qrStop != nil {
+		close(mycli.qrStop)
+		mycli.qrStop = nil
+	}
+}
+
+// qrRotationCurrent reports whether stop still belongs to the live rotation
+// (i.e. it was neither cancelled nor superseded by a newer events.QR batch).
+func (mycli *MyClient) qrRotationCurrent(stop chan struct{}) bool {
+	mycli.qrMu.Lock()
+	defer mycli.qrMu.Unlock()
+	return mycli.qrStop == stop
+}
+
+// nextQRCount increments the QR counter and reports whether the configured
+// maximum (0 = disabled) has been reached.
+func (mycli *MyClient) nextQRCount() (count int, limitReached bool) {
+	mycli.qrMu.Lock()
+	defer mycli.qrMu.Unlock()
+	mycli.qrcodeCount++
+	max := mycli.config.QrcodeMaxCount
+	return mycli.qrcodeCount, max > 0 && mycli.qrcodeCount >= max
+}
+
+// endQRPairing atomically marks QR pairing as ended for this client, but only
+// if stop is still the live rotation. It returns false when the rotation was
+// cancelled/superseded meanwhile, in which case the caller must not tear down
+// (a newer session owns the instance now).
+func (mycli *MyClient) endQRPairing(stop chan struct{}, disconnectReason string) (count int, ok bool) {
+	mycli.qrMu.Lock()
+	defer mycli.qrMu.Unlock()
+	if mycli.qrStop != stop || mycli.qrEnded {
+		return mycli.qrcodeCount, false
+	}
+	mycli.qrEnded = true
+	mycli.qrEndReason = disconnectReason
+	return mycli.qrcodeCount, true
+}
+
+// qrPairingEnded reports whether teardownQR ended QR pairing for this client
+// and the disconnect reason it recorded (may be empty).
+func (mycli *MyClient) qrPairingEnded() (bool, string) {
+	mycli.qrMu.Lock()
+	defer mycli.qrMu.Unlock()
+	return mycli.qrEnded, mycli.qrEndReason
+}
+
+// qrSleepUntil waits until t, returning false early if the rotation is
+// cancelled.
+func qrSleepUntil(t time.Time, stop chan struct{}) bool {
+	d := time.Until(t)
+	if d <= 0 {
+		select {
+		case <-stop:
+			return false
+		default:
+			return true
+		}
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-stop:
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// qrShouldContinue reports whether the rotation is still meaningful: not
+// cancelled, client still alive and connected, and not yet paired. A dropped
+// socket ends the rotation quietly: whoever disconnected (kill branch,
+// ReconnectClient, instance deletion, Disconnected handler) owns the cleanup.
+func (mycli *MyClient) qrShouldContinue(stop chan struct{}) bool {
+	select {
+	case <-stop:
+		return false
+	default:
+	}
+	if mycli.WAClient == nil || mycli.WAClient.Store.ID != nil {
+		return false
+	}
+	return mycli.WAClient.IsConnected()
+}
+
+// waitPasskeyCeremony blocks while a passkey ceremony is in flight for this
+// instance. It returns true once the ceremony is no longer active (failed,
+// expired or cleared) and the rotation should resume, or false when the
+// rotation must stop (cancelled, socket dropped, or pairing succeeded).
+func (mycli *MyClient) waitPasskeyCeremony(stop chan struct{}) bool {
+	ticker := time.NewTicker(qrCeremonyPollEvery)
+	defer ticker.Stop()
+	for {
+		if !mycli.qrShouldContinue(stop) {
+			return false
+		}
+		if mycli.passkeyCeremony == nil || !mycli.passkeyCeremony.HasActiveByInstance(mycli.userID) {
+			return true
+		}
+		select {
+		case <-stop:
+			return false
+		case <-ticker.C:
+		}
+	}
+}
+
 // handleQRCodes forwards a batch of QR codes (events.QR.Codes) to the manager,
 // rotating them with whatsmeow's native timing (first code ~60s, the rest ~20s)
 // WITHOUT using GetQRChannel. GetQRChannel is deliberately avoided for new-device
@@ -1072,137 +1249,178 @@ func processPresenceUpdates(mycli *MyClient) {
 // events.QR here keeps the socket alive for as long as pairing (QR or passkey)
 // needs, since events.QR is dispatched to every handler by pair.go regardless.
 //
-// This preserves the original GetQRChannel-loop behavior byte-for-byte for the
-// per-code work (max-count enforcement, PNG encode, DB persist, webhook/queue
-// fan-out) and the timeout teardown; only the trigger (batch vs. per-code) and
-// the rotation/self-timer are new. Runs in its own goroutine so it never blocks
-// the whatsmeow event dispatch.
+// Only one rotation runs per client: a new batch cancels the previous
+// goroutine, and the rotation also stops on kill/disconnect/PairSuccess.
+// While a passkey ceremony is active the rotation is paused (socket kept
+// alive); if the ceremony fails or expires, rotation resumes with whichever
+// codes are still valid, and once they run out the usual QRTimeout teardown
+// happens. Runs in its own goroutine so it never blocks the event dispatch.
 func (mycli *MyClient) handleQRCodes(codes []string) {
-	go func() {
-		instanceID := mycli.userID
-		for i, code := range codes {
-			// A successful pair (Store.ID set) or an in-flight passkey ceremony
-			// supersedes QR — stop rotating WITHOUT tearing down. Store.ID stays
-			// nil throughout a passkey ceremony (it is only set at PairSuccess),
-			// so we must also consult the ceremony store, otherwise a ceremony
-			// that outlasts QR rotation would have its socket/client torn down.
-			if mycli.WAClient == nil || mycli.WAClient.Store.ID != nil {
-				return
-			}
-			if mycli.passkeyCeremony != nil && mycli.passkeyCeremony.HasActiveByInstance(instanceID) {
-				mycli.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] Passkey ceremony in progress — pausing QR rotation, keeping socket alive", instanceID)
-				return
-			}
-
-			mycli.qrcodeCount++
-
-			if mycli.config.QrcodeMaxCount > 0 {
-				mycli.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] QR code generated #%d (max: %d)", instanceID, mycli.qrcodeCount, mycli.config.QrcodeMaxCount)
-			} else {
-				mycli.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] QR code generated #%d (limit disabled)", instanceID, mycli.qrcodeCount)
-			}
-
-			// Max-count reached: force logout + teardown + QRTimeout (0 = disabled).
-			// But never tear down while a passkey ceremony is in flight.
-			if mycli.config.QrcodeMaxCount > 0 && mycli.qrcodeCount >= mycli.config.QrcodeMaxCount {
-				if mycli.passkeyCeremony != nil && mycli.passkeyCeremony.HasActiveByInstance(instanceID) {
-					mycli.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] QR max-count reached but passkey ceremony active — not tearing down", instanceID)
-					return
-				}
-				mycli.loggerWrapper.GetLogger(instanceID).LogWarn("[%s] Maximum QR code count reached (%d), forcing logout and QRTimeout", instanceID, mycli.config.QrcodeMaxCount)
-
-				if mycli.WAClient.IsConnected() {
-					if err := mycli.WAClient.Logout(context.Background()); err != nil {
-						mycli.loggerWrapper.GetLogger(instanceID).LogWarn("[%s] Error during forced logout: %v", instanceID, err)
-					}
-				}
-				mycli.teardownQR(fmt.Sprintf("Maximum QR code count (%d) reached", mycli.config.QrcodeMaxCount), true)
-				return
-			}
-
-			if mycli.config.LogType != "json" {
-				fmt.Println("QR code:\n", code)
-			}
-
-			image, _ := qrcode.Encode(code, qrcode.Medium, 256)
-			base64qrcode := "data:image/png;base64," + base64.StdEncoding.EncodeToString(image)
-			base64WithCode := base64qrcode + "|" + code
-
-			if err := mycli.instanceRepository.UpdateQrcode(instanceID, base64WithCode); err != nil {
-				mycli.loggerWrapper.GetLogger(instanceID).LogError("[%s] Error updating instance: %s", instanceID, err)
-			}
-
-			postMap := map[string]interface{}{
-				"event": "QRCode",
-				"data": map[string]interface{}{
-					"qrcode":   base64qrcode,
-					"code":     code,
-					"count":    mycli.qrcodeCount,
-					"maxCount": mycli.config.QrcodeMaxCount,
-				},
-				"instanceToken": mycli.token,
-				"instanceId":    instanceID,
-				"instanceName":  mycli.Instance.Name,
-			}
-			queueName := strings.ToLower(fmt.Sprintf("%s.%s", instanceID, "QRCode"))
-			if values, err := json.Marshal(postMap); err == nil {
-				go mycli.service.CallWebhook(mycli.Instance, queueName, values)
-				if mycli.config.AmqpGlobalEnabled || mycli.config.NatsGlobalEnabled {
-					go mycli.service.SendToGlobalQueues("QRCode", values, instanceID)
-				}
-			} else {
-				mycli.loggerWrapper.GetLogger(instanceID).LogError("[%s] Failed to marshal JSON for queue", instanceID)
-			}
-
-			// Rotation timing: first code lives ~60s, subsequent ~20s (whatsmeow native).
-			timeout := 20 * time.Second
-			if i == 0 {
-				timeout = 60 * time.Second
-			}
-			time.Sleep(timeout)
-		}
-
-		// Ran out of codes without a PairSuccess. Treat as QR timeout (mirrors
-		// GetQRChannel's "timeout") — UNLESS a passkey ceremony is in flight, in
-		// which case the socket must stay alive for the ceremony to complete.
-		if mycli.WAClient != nil && mycli.WAClient.Store.ID == nil {
-			if mycli.passkeyCeremony != nil && mycli.passkeyCeremony.HasActiveByInstance(instanceID) {
-				mycli.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] QR codes exhausted but passkey ceremony active — keeping socket alive", instanceID)
-				return
-			}
-			mycli.teardownQR("", false)
-		}
-	}()
+	stop := mycli.beginQRRotation()
+	if stop == nil {
+		return
+	}
+	go mycli.runQRRotation(codes, stop)
 }
 
-// teardownQR clears the QR state and emits a QRTimeout event, then signals the
-// kill channel so StartClient's select loop performs the actual disconnect and
-// map cleanup. IMPORTANT: this method must NOT delete from the shared
-// clientPointer/myClientPointer/killChannel maps itself — those are unsynchronized
-// service-wide maps and this runs in the handleQRCodes goroutine; doing the
-// delete()s here (concurrent with other instances' goroutines and the whatsmeow
-// dispatch) risks a `fatal error: concurrent map writes`. The kill-channel send
-// is blocking (like the original GetQRChannel timeout branch) so the signal is
-// never dropped and the socket can't be orphaned. Cleanup happens in the
-// StartClient goroutine, the single writer of those maps for this instance.
-// If reason is non-empty it is included in the QRTimeout payload (max-count path).
-func (mycli *MyClient) teardownQR(reason string, forceLogout bool) {
+func (mycli *MyClient) runQRRotation(codes []string, stop chan struct{}) {
 	instanceID := mycli.userID
+	start := time.Now()
+
+	// pauseForCeremony waits out an active passkey ceremony. It returns false
+	// if the rotation must stop; otherwise it returns true and advances i past
+	// codes whose validity window elapsed during the pause.
+	pauseForCeremony := func(i *int) bool {
+		if mycli.passkeyCeremony == nil || !mycli.passkeyCeremony.HasActiveByInstance(instanceID) {
+			return true
+		}
+		mycli.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] Passkey ceremony in progress — pausing QR rotation, keeping socket alive", instanceID)
+		if !mycli.waitPasskeyCeremony(stop) {
+			return false
+		}
+		elapsed := time.Since(start)
+		for *i < len(codes) && qrCodeExpiry(*i) <= elapsed {
+			*i++
+		}
+		mycli.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] Passkey ceremony no longer active — resuming QR rotation (%d code(s) left)", instanceID, len(codes)-*i)
+		return true
+	}
+
+	for i := 0; i < len(codes); {
+		if !mycli.qrShouldContinue(stop) {
+			return
+		}
+		// A passkey ceremony supersedes QR: pause without tearing down.
+		// Store.ID stays nil throughout a ceremony (only set at PairSuccess).
+		before := i
+		if !pauseForCeremony(&i) {
+			return
+		}
+		if i != before || i >= len(codes) {
+			continue
+		}
+
+		code := codes[i]
+		count, limitReached := mycli.nextQRCount()
+
+		if mycli.config.QrcodeMaxCount > 0 {
+			mycli.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] QR code generated #%d (max: %d)", instanceID, count, mycli.config.QrcodeMaxCount)
+		} else {
+			mycli.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] QR code generated #%d (limit disabled)", instanceID, count)
+		}
+
+		// Max-count reached: force logout + teardown + QRTimeout (0 = disabled).
+		if limitReached {
+			mycli.loggerWrapper.GetLogger(instanceID).LogWarn("[%s] Maximum QR code count reached (%d), forcing logout and QRTimeout", instanceID, mycli.config.QrcodeMaxCount)
+			mycli.teardownQR(stop,
+				fmt.Sprintf("Maximum QR code count (%d) reached", mycli.config.QrcodeMaxCount),
+				fmt.Sprintf("QR code limit reached (%d)", mycli.config.QrcodeMaxCount),
+				true)
+			return
+		}
+
+		if mycli.config.LogType != "json" {
+			fmt.Println("QR code:\n", code)
+		}
+
+		image, _ := qrcode.Encode(code, qrcode.Medium, 256)
+		base64qrcode := "data:image/png;base64," + base64.StdEncoding.EncodeToString(image)
+		base64WithCode := base64qrcode + "|" + code
+
+		// Re-check right before persisting so a cancelled/superseded rotation
+		// never overwrites a newer code in the DB.
+		if !mycli.qrRotationCurrent(stop) {
+			return
+		}
+		if err := mycli.instanceRepository.UpdateQrcode(instanceID, base64WithCode); err != nil {
+			mycli.loggerWrapper.GetLogger(instanceID).LogError("[%s] Error updating instance: %s", instanceID, err)
+		}
+
+		postMap := map[string]interface{}{
+			"event": "QRCode",
+			"data": map[string]interface{}{
+				"qrcode":   base64qrcode,
+				"code":     code,
+				"count":    count,
+				"maxCount": mycli.config.QrcodeMaxCount,
+			},
+			"instanceToken": mycli.token,
+			"instanceId":    instanceID,
+			"instanceName":  mycli.Instance.Name,
+		}
+		queueName := strings.ToLower(fmt.Sprintf("%s.%s", instanceID, "QRCode"))
+		if values, err := json.Marshal(postMap); err == nil {
+			go mycli.service.CallWebhook(mycli.Instance, queueName, values)
+			if mycli.config.AmqpGlobalEnabled || mycli.config.NatsGlobalEnabled {
+				go mycli.service.SendToGlobalQueues("QRCode", values, instanceID)
+			}
+		} else {
+			mycli.loggerWrapper.GetLogger(instanceID).LogError("[%s] Failed to marshal JSON for queue", instanceID)
+		}
+
+		if !qrSleepUntil(start.Add(qrCodeExpiry(i)), stop) {
+			return
+		}
+		i++
+	}
+
+	// Ran out of codes without a PairSuccess. If a passkey ceremony is in
+	// flight, keep the socket alive until it finishes; only tear down if it
+	// fails/expires without pairing. Then treat as QR timeout (mirrors
+	// GetQRChannel's "timeout").
+	if !mycli.qrShouldContinue(stop) {
+		return
+	}
+	if mycli.passkeyCeremony != nil && mycli.passkeyCeremony.HasActiveByInstance(instanceID) {
+		mycli.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] QR codes exhausted but passkey ceremony active — keeping socket alive", instanceID)
+		if !mycli.waitPasskeyCeremony(stop) {
+			return
+		}
+	}
+	mycli.teardownQR(stop, "", "", false)
+}
+
+// teardownQR ends QR pairing for this client: it clears the QR state, emits a
+// QRTimeout event and signals StartClient's select loop, which disconnects,
+// cleans up the shared maps and — because qrEnded is set — does NOT restart
+// the client (otherwise a new QR batch would start with the counter reset and
+// the max-count limit would never stop anything).
+//
+// It never touches the shared clientPointer/myClientPointer/killChannel maps:
+// they are unsynchronized service-wide maps and this runs in the rotation
+// goroutine. The kill channel was captured into mycli.killCh by StartClient.
+//
+// payloadReason (may be empty) goes into the QRTimeout payload;
+// disconnectReason (may be empty) is persisted as the instance's
+// DisconnectReason. forceLogout logs the half-open pairing session out first.
+func (mycli *MyClient) teardownQR(stop chan struct{}, payloadReason, disconnectReason string, forceLogout bool) {
+	instanceID := mycli.userID
+
+	count, ok := mycli.endQRPairing(stop, disconnectReason)
+	if !ok {
+		return
+	}
+
+	if forceLogout && mycli.WAClient != nil && mycli.WAClient.IsConnected() {
+		if err := mycli.WAClient.Logout(context.Background()); err != nil {
+			mycli.loggerWrapper.GetLogger(instanceID).LogWarn("[%s] Error during forced logout: %v", instanceID, err)
+		}
+	}
 
 	if err := mycli.instanceRepository.UpdateQrcode(instanceID, ""); err != nil {
 		mycli.loggerWrapper.GetLogger(instanceID).LogError("[%s] Error updating instance: %s", instanceID, err)
 	}
 
-	if reason != "" {
-		if err := mycli.instanceRepository.UpdateConnected(instanceID, false, reason); err != nil {
+	if disconnectReason != "" {
+		if err := mycli.instanceRepository.UpdateConnected(instanceID, false, disconnectReason); err != nil {
 			mycli.loggerWrapper.GetLogger(instanceID).LogError("[%s] Error updating instance status: %v", instanceID, err)
 		}
 	}
 
 	data := map[string]interface{}{}
-	if reason != "" {
-		data["reason"] = reason
-		data["qrcount"] = mycli.qrcodeCount
+	if payloadReason != "" {
+		data["reason"] = payloadReason
+		data["qrcount"] = count
 		data["maxCount"] = mycli.config.QrcodeMaxCount
 		data["forceLogout"] = forceLogout
 	}
@@ -1221,13 +1439,39 @@ func (mycli *MyClient) teardownQR(reason string, forceLogout bool) {
 		}
 	}
 
-	// Signal StartClient's select loop to disconnect and clean up the shared
-	// maps (it is the single writer for this instance). Blocking send mirrors
-	// the original timeout branch so the signal is never dropped.
-	mycli.loggerWrapper.GetLogger(instanceID).LogWarn("[%s] QR timeout — signaling kill channel", instanceID)
-	mycli.qrExpired.Store(true)
-	if killChan, exists := mycli.killChannel[instanceID]; exists {
-		killChan <- true
+	mycli.loggerWrapper.GetLogger(instanceID).LogWarn("[%s] QR pairing ended — signaling kill channel", instanceID)
+	if !mycli.signalKill(stop) {
+		// Nobody consumed the signal (loop gone or channel replaced): at
+		// least close the half-open socket so it is not orphaned.
+		mycli.loggerWrapper.GetLogger(instanceID).LogWarn("[%s] Kill signal not consumed, disconnecting client directly", instanceID)
+		if mycli.WAClient != nil {
+			mycli.WAClient.Disconnect()
+		}
+	}
+}
+
+// signalKill delivers a kill signal on the channel captured at client creation,
+// giving up if the rotation is cancelled or nobody receives within
+// qrKillSignalTimeout. It recovers from a send on a channel that was closed by
+// ClearInstanceCache in the meantime.
+func (mycli *MyClient) signalKill(stop chan struct{}) (sent bool) {
+	if mycli.killCh == nil {
+		return false
+	}
+	defer func() {
+		if recover() != nil {
+			sent = false
+		}
+	}()
+	timer := time.NewTimer(qrKillSignalTimeout)
+	defer timer.Stop()
+	select {
+	case mycli.killCh <- true:
+		return true
+	case <-stop:
+		return true // kill branch already running (it cancels the rotation first)
+	case <-timer.C:
+		return false
 	}
 }
 
@@ -1353,6 +1597,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			}
 		}
 	case *events.PairSuccess:
+		mycli.stopQRRotation()
 		doWebhook = true
 		postMap["event"] = "PairSuccess"
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("QR Pair Success for user '%s' with JID '%s' - '%s'", mycli.userID, evt.ID.String(), mycli.WAClient.Store.ID.String())
@@ -2272,6 +2517,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		}
 		return
 	case *events.LoggedOut:
+		mycli.stopQRRotation()
 		doWebhook = true
 		postMap["event"] = "LoggedOut"
 		mycli.stopSession()
@@ -2420,6 +2666,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Error updating instance: %s", mycli.Instance.Id, err)
 		}
 	case *events.Disconnected:
+		// Stop QR rotation first: a dropped socket ends pairing whatever the
+		// session state is.
+		mycli.stopQRRotation()
 		if mycli.sessionEnded.Load() {
 			// The terminal event already stopped the cycle; the socket close that
 			// follows must not schedule it again.

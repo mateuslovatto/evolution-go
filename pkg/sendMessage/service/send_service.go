@@ -1868,8 +1868,19 @@ func (s *sendService) SendButton(data *ButtonStruct, instance *instance_model.In
 			})
 		}
 
+		// Title is rendered in bold at the top of the body (same format as the
+		// CTA/native-flow path), so it is shown whether or not a media header
+		// is attached.
+		contentText := data.Description
+		if data.Title != "" {
+			contentText = "*" + data.Title + "*"
+			if data.Description != "" {
+				contentText += "\n\n" + data.Description
+			}
+		}
+
 		buttonsMsg := &waE2E.ButtonsMessage{
-			ContentText: proto.String(data.Description),
+			ContentText: proto.String(contentText),
 			FooterText:  proto.String(data.Footer),
 			HeaderType:  waE2E.ButtonsMessage_EMPTY.Enum(),
 			Buttons:     replyButtons,
@@ -1877,46 +1888,46 @@ func (s *sendService) SendButton(data *ButtonStruct, instance *instance_model.In
 
 		// Optional media header (image or video URL).
 		if data.ImageUrl != "" {
-			if resp, err := http.Get(data.ImageUrl); err == nil {
-				fileData, readErr := io.ReadAll(resp.Body)
-				resp.Body.Close()
-				if readErr == nil {
-					if uploaded, upErr := client.Upload(context.Background(), fileData, whatsmeow.MediaImage); upErr == nil {
-						buttonsMsg.HeaderType = waE2E.ButtonsMessage_IMAGE.Enum()
-						buttonsMsg.Header = &waE2E.ButtonsMessage_ImageMessage{
-							ImageMessage: &waE2E.ImageMessage{
-								URL:           proto.String(uploaded.URL),
-								DirectPath:    proto.String(uploaded.DirectPath),
-								MediaKey:      uploaded.MediaKey,
-								Mimetype:      proto.String("image/jpeg"),
-								FileEncSHA256: uploaded.FileEncSHA256,
-								FileSHA256:    uploaded.FileSHA256,
-								FileLength:    proto.Uint64(uint64(len(fileData))),
-							},
-						}
-					}
-				}
+			fileData, mime, err := fetchButtonHeaderMedia(data.ImageUrl, "image/")
+			if err != nil {
+				return nil, fmt.Errorf("failed to load imageUrl for button header: %w", err)
+			}
+			uploaded, err := client.Upload(context.Background(), fileData, whatsmeow.MediaImage)
+			if err != nil {
+				return nil, fmt.Errorf("failed to upload button header image: %w", err)
+			}
+			buttonsMsg.HeaderType = waE2E.ButtonsMessage_IMAGE.Enum()
+			buttonsMsg.Header = &waE2E.ButtonsMessage_ImageMessage{
+				ImageMessage: &waE2E.ImageMessage{
+					URL:           proto.String(uploaded.URL),
+					DirectPath:    proto.String(uploaded.DirectPath),
+					MediaKey:      uploaded.MediaKey,
+					Mimetype:      proto.String(mime),
+					FileEncSHA256: uploaded.FileEncSHA256,
+					FileSHA256:    uploaded.FileSHA256,
+					FileLength:    proto.Uint64(uint64(len(fileData))),
+				},
 			}
 		} else if data.VideoUrl != "" {
-			if resp, err := http.Get(data.VideoUrl); err == nil {
-				fileData, readErr := io.ReadAll(resp.Body)
-				resp.Body.Close()
-				if readErr == nil {
-					if uploaded, upErr := client.Upload(context.Background(), fileData, whatsmeow.MediaVideo); upErr == nil {
-						buttonsMsg.HeaderType = waE2E.ButtonsMessage_VIDEO.Enum()
-						buttonsMsg.Header = &waE2E.ButtonsMessage_VideoMessage{
-							VideoMessage: &waE2E.VideoMessage{
-								URL:           proto.String(uploaded.URL),
-								DirectPath:    proto.String(uploaded.DirectPath),
-								MediaKey:      uploaded.MediaKey,
-								Mimetype:      proto.String("video/mp4"),
-								FileEncSHA256: uploaded.FileEncSHA256,
-								FileSHA256:    uploaded.FileSHA256,
-								FileLength:    proto.Uint64(uint64(len(fileData))),
-							},
-						}
-					}
-				}
+			fileData, mime, err := fetchButtonHeaderMedia(data.VideoUrl, "video/")
+			if err != nil {
+				return nil, fmt.Errorf("failed to load videoUrl for button header: %w", err)
+			}
+			uploaded, err := client.Upload(context.Background(), fileData, whatsmeow.MediaVideo)
+			if err != nil {
+				return nil, fmt.Errorf("failed to upload button header video: %w", err)
+			}
+			buttonsMsg.HeaderType = waE2E.ButtonsMessage_VIDEO.Enum()
+			buttonsMsg.Header = &waE2E.ButtonsMessage_VideoMessage{
+				VideoMessage: &waE2E.VideoMessage{
+					URL:           proto.String(uploaded.URL),
+					DirectPath:    proto.String(uploaded.DirectPath),
+					MediaKey:      uploaded.MediaKey,
+					Mimetype:      proto.String(mime),
+					FileEncSHA256: uploaded.FileEncSHA256,
+					FileSHA256:    uploaded.FileSHA256,
+					FileLength:    proto.Uint64(uint64(len(fileData))),
+				},
 			}
 		}
 
@@ -2129,6 +2140,56 @@ func makeJPEGThumbnail(fileData []byte, maxWidth int) []byte {
 	return thumbBuf.Bytes()
 }
 
+const (
+	// buttonMediaFetchTimeout bounds the whole download of a button header
+	// media URL so a slow or hung host cannot block /send/button forever.
+	buttonMediaFetchTimeout = 30 * time.Second
+	// buttonMediaMaxBytes caps the downloaded header media size.
+	buttonMediaMaxBytes = 64 << 20
+)
+
+var buttonMediaHTTPClient = &http.Client{Timeout: buttonMediaFetchTimeout}
+
+// fetchButtonHeaderMedia downloads a button header media URL with a timeout,
+// rejects non-2xx responses and oversized bodies, sniffs the real MIME type
+// from the content and checks it matches wantPrefix ("image/" or "video/"),
+// so an error page or a mislabeled file is never uploaded as media.
+func fetchButtonHeaderMedia(url, wantPrefix string) ([]byte, string, error) {
+	resp, err := buttonMediaHTTPClient.Get(url)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, "", fmt.Errorf("unexpected HTTP status %d", resp.StatusCode)
+	}
+
+	fileData, err := io.ReadAll(io.LimitReader(resp.Body, buttonMediaMaxBytes+1))
+	if err != nil {
+		return nil, "", err
+	}
+	if len(fileData) == 0 {
+		return nil, "", errors.New("empty response body")
+	}
+	if len(fileData) > buttonMediaMaxBytes {
+		return nil, "", fmt.Errorf("media exceeds %d bytes", buttonMediaMaxBytes)
+	}
+
+	mime := mimetype.Detect(fileData).String()
+	if i := strings.IndexByte(mime, ';'); i >= 0 {
+		mime = strings.TrimSpace(mime[:i])
+	}
+	if !strings.HasPrefix(mime, wantPrefix) {
+		return nil, "", fmt.Errorf("unexpected content type %q (expected %s*)", mime, wantPrefix)
+	}
+	return fileData, mime, nil
+}
+
+// pdfThumbnailTimeout bounds pdftoppm so a crafted or very complex PDF cannot
+// hang the send request (and pile up processes on retries).
+const pdfThumbnailTimeout = 10 * time.Second
+
 // makePDFThumbnail rasterizes the first page of a PDF into a JPEG thumbnail
 // using the external "pdftoppm" tool (poppler-utils). It returns nil when
 // pdftoppm is not installed or rasterization fails, so callers can gracefully
@@ -2145,7 +2206,9 @@ func makePDFThumbnail(fileData []byte, maxWidth int) []byte {
 
 	// Render only the first page to a PNG on stdout, scaled to scaleWidth.
 	// "-scale-to-y -1" keeps the original aspect ratio.
-	cmd := exec.Command("pdftoppm",
+	ctx, cancel := context.WithTimeout(context.Background(), pdfThumbnailTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "pdftoppm",
 		"-png",
 		"-f", "1",
 		"-l", "1",
@@ -2154,6 +2217,8 @@ func makePDFThumbnail(fileData []byte, maxWidth int) []byte {
 		"-scale-to-y", "-1",
 	)
 	cmd.Stdin = bytes.NewReader(fileData)
+	// Do not wait indefinitely for I/O after the process is killed.
+	cmd.WaitDelay = 2 * time.Second
 
 	var out bytes.Buffer
 	cmd.Stdout = &out

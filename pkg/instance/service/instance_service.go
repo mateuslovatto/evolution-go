@@ -103,6 +103,24 @@ type QrcodeStruct struct {
 	PasskeyCode    string `json:"passkeyCode,omitempty"`
 }
 
+// MarshalJSON keeps the /instance/qr response backward compatible: before the
+// json tags were added the keys were serialized as "Qrcode"/"Code", and
+// existing integrations read those case-sensitively. Both spellings are
+// emitted — the legacy ones for old clients, the lowercase ones for the
+// bundled manager and new clients.
+func (q QrcodeStruct) MarshalJSON() ([]byte, error) {
+	type alias QrcodeStruct
+	return json.Marshal(struct {
+		LegacyQrcode string `json:"Qrcode"`
+		LegacyCode   string `json:"Code"`
+		alias
+	}{
+		LegacyQrcode: q.Qrcode,
+		LegacyCode:   q.Code,
+		alias:        alias(q),
+	})
+}
+
 type PairStruct struct {
 	Subscribe []string `json:"subscribe"`
 	Phone     string   `json:"phone"`

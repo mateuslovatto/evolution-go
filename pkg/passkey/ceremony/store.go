@@ -141,8 +141,15 @@ func (s *Store) SetConfirmation(instanceID, code string, skipHandoffUX bool) {
 }
 
 // SetAwaitingConfirmation is set right after the WebAuthn response is submitted.
+// It only advances a ceremony that is still in the challenge stage: the
+// server's PairPasskeyConfirmation (handled on the event goroutine) can arrive
+// before SendPasskeyResponse returns, and must not be regressed back to
+// awaiting_confirmation — the extension would never show the Confirm button.
 func (s *Store) SetAwaitingConfirmation(instanceID string) {
 	s.setStateByInstance(instanceID, func(st *State) {
+		if st.Stage != StageChallenge {
+			return
+		}
 		st.Stage = StageAwaitingConfirmation
 		st.PublicKey = nil
 		st.Error = ""
