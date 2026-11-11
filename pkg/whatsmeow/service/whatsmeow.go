@@ -1171,6 +1171,31 @@ func (mycli *MyClient) endQRPairing(stop chan struct{}, disconnectReason string)
 	return mycli.qrcodeCount, true
 }
 
+// abortQRPairing marks QR pairing as ended from outside the rotation (the
+// socket dropped before PairSuccess), cancelling the live rotation if any.
+// It shares qrMu/qrEnded with endQRPairing, so exactly one of the two ends a
+// given pairing. Returns false if pairing had already been ended.
+func (mycli *MyClient) abortQRPairing(disconnectReason string) (count int, ok bool) {
+	mycli.qrMu.Lock()
+	defer mycli.qrMu.Unlock()
+	if mycli.qrEnded {
+		return mycli.qrcodeCount, false
+	}
+	if mycli.qrStop != nil {
+		close(mycli.qrStop)
+		mycli.qrStop = nil
+	}
+	mycli.qrEnded = true
+	mycli.qrEndReason = disconnectReason
+	return mycli.qrcodeCount, true
+}
+
+// isPairing reports whether this client is a new-device pairing session (a
+// live client without a device ID yet), as opposed to a logged session.
+func (mycli *MyClient) isPairing() bool {
+	return mycli.WAClient != nil && mycli.WAClient.Store != nil && mycli.WAClient.Store.ID == nil
+}
+
 // qrPairingEnded reports whether teardownQR ended QR pairing for this client
 // and the disconnect reason it recorded (may be empty).
 func (mycli *MyClient) qrPairingEnded() (bool, string) {
@@ -1205,6 +1230,8 @@ func qrSleepUntil(t time.Time, stop chan struct{}) bool {
 // cancelled, client still alive and connected, and not yet paired. A dropped
 // socket ends the rotation quietly: whoever disconnected (kill branch,
 // ReconnectClient, instance deletion, Disconnected handler) owns the cleanup.
+// With a proxy, the Disconnected handler ends the pairing itself via
+// endQRPairingOnDrop (there is no logged session for the proxy retry to restore).
 func (mycli *MyClient) qrShouldContinue(stop chan struct{}) bool {
 	select {
 	case <-stop:
@@ -1394,12 +1421,33 @@ func (mycli *MyClient) runQRRotation(codes []string, stop chan struct{}) {
 // disconnectReason (may be empty) is persisted as the instance's
 // DisconnectReason. forceLogout logs the half-open pairing session out first.
 func (mycli *MyClient) teardownQR(stop chan struct{}, payloadReason, disconnectReason string, forceLogout bool) {
-	instanceID := mycli.userID
-
 	count, ok := mycli.endQRPairing(stop, disconnectReason)
 	if !ok {
 		return
 	}
+	mycli.finishQRPairing(stop, count, payloadReason, disconnectReason, forceLogout)
+}
+
+// endQRPairingOnDrop ends a QR pairing whose socket dropped before PairSuccess
+// (proxy sessions; see the Disconnected handler). Same outcome as teardownQR:
+// QR cleared, QRTimeout emitted with the reason, kill signalled so StartClient
+// cleans the maps and — qrEnded being set — does not restart. A no-op if the
+// rotation already ended the pairing. Blocks up to qrKillSignalTimeout, so the
+// event handler runs it in its own goroutine.
+func (mycli *MyClient) endQRPairingOnDrop(reason string) {
+	count, ok := mycli.abortQRPairing(reason)
+	if !ok {
+		return
+	}
+	mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Socket dropped during QR pairing (%s): ending pairing, client will not restart", mycli.userID, reason)
+	mycli.finishQRPairing(nil, count, reason, reason, false)
+}
+
+// finishQRPairing performs the side effects of an ended QR pairing. Callers
+// must have won endQRPairing/abortQRPairing first. stop may be nil when there
+// is no rotation to wait on.
+func (mycli *MyClient) finishQRPairing(stop chan struct{}, count int, payloadReason, disconnectReason string, forceLogout bool) {
+	instanceID := mycli.userID
 
 	if forceLogout && mycli.WAClient != nil && mycli.WAClient.IsConnected() {
 		if err := mycli.WAClient.Logout(context.Background()); err != nil {
@@ -2692,10 +2740,22 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			if err != nil {
 				mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Error updating instance: %s", mycli.Instance.Id, err)
 			}
-			mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn(
-				"[%s] Disconnected with proxy; emitting ConnectFailure (%s) and scheduling reconnect through the same proxy", mycli.userID, reason,
-			)
-			mycli.service.StartProxyRetry(mycli.Instance.Id)
+			if mycli.isPairing() {
+				// Dropped during QR pairing: there is no logged session for the
+				// proxy retry to restore (it would exit at once on Jid == ""),
+				// and the rotation stopped quietly above. End the pairing here
+				// so the dead QR is cleared and StartClient cleans up without
+				// restarting; the next /instance/qr or /connect starts afresh.
+				mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn(
+					"[%s] Disconnected with proxy during QR pairing; emitting ConnectFailure (%s) and ending the pairing", mycli.userID, reason,
+				)
+				go mycli.endQRPairingOnDrop(reason)
+			} else {
+				mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn(
+					"[%s] Disconnected with proxy; emitting ConnectFailure (%s) and scheduling reconnect through the same proxy", mycli.userID, reason,
+				)
+				mycli.service.StartProxyRetry(mycli.Instance.Id)
+			}
 		} else {
 			postMap["event"] = "Disconnected"
 			mycli.Instance.DisconnectReason = "Disconnected emitted because the websocket is closed by the server."
