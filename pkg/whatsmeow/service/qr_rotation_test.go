@@ -89,32 +89,48 @@ func TestNextQRCountLimit(t *testing.T) {
 }
 
 func TestSignalKill(t *testing.T) {
-	stop := make(chan struct{})
-
 	// Delivered to a receiver.
 	ch := make(chan bool)
 	mycli := &MyClient{killCh: ch}
 	go func() { <-ch }()
-	if !mycli.signalKill(stop) {
+	if !mycli.signalKill() {
 		t.Fatal("signal should be delivered")
 	}
 
 	// Nil channel (instance deleted before the client started): no block.
-	if (&MyClient{}).signalKill(stop) {
+	if (&MyClient{}).signalKill() {
 		t.Fatal("nil kill channel cannot be signaled")
 	}
 
 	// Channel closed by ClearInstanceCache: must not panic.
 	closed := make(chan bool)
 	close(closed)
-	if (&MyClient{killCh: closed}).signalKill(stop) {
+	if (&MyClient{killCh: closed}).signalKill() {
 		t.Fatal("send on a closed channel must report failure")
 	}
 
-	// Rotation cancelled while waiting: returns without blocking.
-	cancelled := make(chan struct{})
-	close(cancelled)
-	if !(&MyClient{killCh: make(chan bool)}).signalKill(cancelled) {
-		t.Fatal("cancelled rotation means the kill branch is already running")
+	// Kill branch already claimed the client: returns without sending.
+	claimed := &MyClient{config: &config.Config{}, killCh: make(chan bool), killStarted: make(chan struct{})}
+	claimed.claimKill()
+	if !claimed.signalKill() {
+		t.Fatal("a claimed client means the kill branch is already running")
+	}
+
+	// A cancelled QR rotation is NOT proof that the kill branch runs
+	// (Disconnected/PairSuccess/LoggedOut also cancel it): the signal must
+	// still be delivered. The previous version returned true here without
+	// sending, which left the instance stuck (QA D2).
+	waiting := &MyClient{config: &config.Config{}, killCh: make(chan bool), killStarted: make(chan struct{})}
+	waiting.beginQRRotation()
+	waiting.stopQRRotation()
+	result := make(chan bool, 1)
+	go func() { result <- waiting.signalKill() }()
+	select {
+	case <-waiting.killCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("kill not delivered after the rotation was cancelled")
+	}
+	if !<-result {
+		t.Fatal("delivered kill must report success")
 	}
 }

@@ -1,6 +1,6 @@
 package whatsmeow_service
 
-// PR #6 sobre a sbx (Cobalto, evo_pr6-fix1): queda do socket com proxy durante
+// PR #6 sobre a sbx (Cobalto, evo_pr6-fix1/fix2): queda do socket com proxy durante
 // o pareamento por QR encerra o pareamento pelo mesmo caminho do teardownQR,
 // e sessão logada continua com o retry pelo mesmo proxy.
 
@@ -103,23 +103,24 @@ func cobaltoMyClient(t *testing.T, logged bool) (*MyClient, *cobaltoRepo, *produ
 	return mycli, repo, producer, spy
 }
 
-// Só um dos dois gatilhos encerra o pareamento: a queda do socket (abort) ou
-// a rotação (endQRPairing). Depois disso, events.QR tardio não reabre nada.
+// Só um dos dois gatilhos encerra o pareamento: a queda do socket com proxy
+// (resolveProxyDrop) ou a rotação (endQRPairing). Depois disso, events.QR
+// tardio não reabre nada.
 func TestCobaltoPR6AbortAndRotationEndPairingOnce(t *testing.T) {
 	// Queda primeiro: cancela a rotação viva e a rotação perde a corrida.
-	mycli := &MyClient{config: &config.Config{}}
+	mycli := &MyClient{config: &config.Config{}, WAClient: cobaltoClient(t, false)}
 	stop := mycli.beginQRRotation()
-	if _, ok := mycli.abortQRPairing("proxy_error:unreachable"); !ok {
-		t.Fatal("abort deveria encerrar o pareamento")
+	if outcome, _ := mycli.resolveProxyDrop("proxy_error:unreachable"); outcome != proxyDropEndPairing {
+		t.Fatalf("queda deveria encerrar o pareamento, outcome=%d", outcome)
 	}
 	if !isDone(stop) {
-		t.Fatal("abort não cancelou a rotação viva")
+		t.Fatal("queda não cancelou a rotação viva")
 	}
 	if _, ok := mycli.endQRPairing(stop, "QR code limit reached (5)"); ok {
 		t.Fatal("rotação cancelada não pode encerrar de novo")
 	}
-	if _, ok := mycli.abortQRPairing("outro"); ok {
-		t.Fatal("abort duplo não pode encerrar de novo")
+	if outcome, _ := mycli.resolveProxyDrop("outro"); outcome != proxyDropOwned {
+		t.Fatalf("queda dupla não pode encerrar de novo, outcome=%d", outcome)
 	}
 	if mycli.beginQRRotation() != nil {
 		t.Fatal("events.QR tardio reabriu a rotação")
@@ -128,14 +129,14 @@ func TestCobaltoPR6AbortAndRotationEndPairingOnce(t *testing.T) {
 		t.Fatalf("qrPairingEnded = %v, %q", ended, reason)
 	}
 
-	// Rotação primeiro: o abort chega tarde e não sobrescreve o motivo.
-	mycli = &MyClient{config: &config.Config{}}
+	// Rotação primeiro: a queda chega tarde e não sobrescreve o motivo.
+	mycli = &MyClient{config: &config.Config{}, WAClient: cobaltoClient(t, false)}
 	stop = mycli.beginQRRotation()
 	if _, ok := mycli.endQRPairing(stop, "QR code limit reached (5)"); !ok {
 		t.Fatal("rotação viva deveria encerrar o pareamento")
 	}
-	if _, ok := mycli.abortQRPairing("proxy_error:unreachable"); ok {
-		t.Fatal("abort depois do teardown não pode encerrar de novo")
+	if outcome, _ := mycli.resolveProxyDrop("proxy_error:unreachable"); outcome != proxyDropOwned {
+		t.Fatalf("queda depois do teardown não pode encerrar de novo, outcome=%d", outcome)
 	}
 	if _, reason := mycli.qrPairingEnded(); reason != "QR code limit reached (5)" {
 		t.Fatalf("motivo sobrescrito: %q", reason)
