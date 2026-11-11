@@ -1093,8 +1093,9 @@ func (w *whatsmeowService) StartClient(cd *ClientData) {
 // reloginAfterRestart reconnects this same client after a stream restart (515
 // at the end of a pairing: 515 → reconnect → Connected; or the undecryptable
 // 66/67 recovery). It runs in StartClient's goroutine, serialized with the
-// kill branch, so a client the kill branch stopped can never come back, and it
-// only proceeds while this client still owns the instance in the maps. The
+// kill branch, so a client the kill branch stopped — or whose session WhatsApp
+// ended (sessionEnded) — can never come back, and it only proceeds while this
+// client still owns the instance in the maps. The
 // same *whatsmeow.Client and the same connect function are reused: the proxy
 // applied by applyProxy stays on the client and connectStrict keeps the strict
 // (fail-closed) path. No new client is started (F4). Returns false when
@@ -1109,11 +1110,16 @@ func (w *whatsmeowService) reloginAfterRestart(
 	id := cd.Instance.Id
 	logger := w.loggerWrapper.GetLogger(id)
 
-	if !mycli.beginRelogin() {
-		// QR pairing ended: this client is being stopped and its kill is on
-		// the way. Keep the loop running so the kill branch handles it.
-		logger.LogInfo("[%s] Reconnect request ignored: QR pairing ended, client is being stopped", id)
-		client.Disconnect()
+	// Close the old socket first: from here on it delivers no new events, so
+	// the stop check below sees the terminal events it already produced.
+	client.Disconnect()
+
+	if ok, why := mycli.beginRelogin(); !ok {
+		// The client is being stopped (pairing ended → kill on the way;
+		// LoggedOut → kill on the way; ban/stream replaced → session over).
+		// Keep the loop running, as without the request, so a pending kill
+		// is still handled.
+		logger.LogInfo("[%s] Reconnect request ignored: %s", id, why)
 		return true
 	}
 	if w.myClientPointer[id] != mycli || w.clientPointer[id] != client {
@@ -1121,13 +1127,24 @@ func (w *whatsmeowService) reloginAfterRestart(
 		// instance: this client is stale and must stay down.
 		mycli.endRelogin()
 		logger.LogWarn("[%s] Reconnect request ignored: client no longer owns the instance", id)
-		client.Disconnect()
 		return false
 	}
 
 	logger.LogInfo("[%s] Stream restart: reconnecting the same client (proxy: %v)", id, proxyConfigured)
-	client.Disconnect()
 	err := connect(cd, client, proxyConfigured)
+
+	// A terminal event already in flight when the old socket closed (whatsmeow
+	// dispatches some of them from goroutines) may have landed during the
+	// connect: never leave such a client connected, and never "recover" it.
+	if blocked, why := mycli.reloginBlocked(); blocked {
+		mycli.endRelogin()
+		logger.LogWarn("[%s] Client stopped during reconnect (%s): staying disconnected", id, why)
+		client.Disconnect()
+		// With a proxy, a failed strict connect already cleaned the maps
+		// (failProxyStart): nothing left for this loop. Otherwise keep it
+		// running for a pending kill, as above.
+		return err == nil || !proxyConfigured
+	}
 	mycli.endRelogin()
 	if err == nil {
 		return true
@@ -1265,14 +1282,36 @@ func (mycli *MyClient) claimKill() (qrEnded bool, qrEndReason string) {
 	return mycli.qrEnded, mycli.qrEndReason
 }
 
+// reloginBlockedLocked reports why this client must not be reconnected: the
+// kill branch claimed it, its QR pairing ended, or WhatsApp ended the session
+// (sessionEnded: LoggedOut, TemporaryBan, StreamReplaced, terminal
+// ConnectFailure). Caller holds qrMu.
+func (mycli *MyClient) reloginBlockedLocked() (blocked bool, why string) {
+	switch {
+	case mycli.killClaimed:
+		return true, "kill branch owns the client"
+	case mycli.qrEnded:
+		return true, "QR pairing ended, client is being stopped"
+	case mycli.sessionEnded.Load():
+		return true, "session ended (logout, ban or stream replaced)"
+	}
+	return false, ""
+}
+
+func (mycli *MyClient) reloginBlocked() (bool, string) {
+	mycli.qrMu.Lock()
+	defer mycli.qrMu.Unlock()
+	return mycli.reloginBlockedLocked()
+}
+
 // requestRelogin queues a reconnect of this same client for StartClient's
-// loop. It is refused (false) once the kill branch has claimed the client or
-// the QR pairing has ended (the client is being stopped and must not come
-// back), or when there is no loop to serve it. Requests coalesce.
+// loop. It is refused (false) when the client must not come back (see
+// reloginBlockedLocked) or when there is no loop to serve it. Requests
+// coalesce.
 func (mycli *MyClient) requestRelogin() bool {
 	mycli.qrMu.Lock()
 	defer mycli.qrMu.Unlock()
-	if mycli.killClaimed || mycli.qrEnded || mycli.relogin == nil {
+	if blocked, _ := mycli.reloginBlockedLocked(); blocked || mycli.relogin == nil {
 		return false
 	}
 	mycli.reloginPending = true
@@ -1284,15 +1323,16 @@ func (mycli *MyClient) requestRelogin() bool {
 }
 
 // beginRelogin is called by StartClient's loop when it picks a request up.
-// It re-checks the stop decision (the pairing may have ended meanwhile).
-func (mycli *MyClient) beginRelogin() bool {
+// It re-checks the stop decision: the pairing may have ended, or the session
+// may have been ended by WhatsApp, after the request was queued.
+func (mycli *MyClient) beginRelogin() (ok bool, why string) {
 	mycli.qrMu.Lock()
 	defer mycli.qrMu.Unlock()
-	if mycli.killClaimed || mycli.qrEnded {
+	if blocked, why := mycli.reloginBlockedLocked(); blocked {
 		mycli.reloginPending = false
-		return false
+		return false, why
 	}
-	return true
+	return true, ""
 }
 
 func (mycli *MyClient) endRelogin() {

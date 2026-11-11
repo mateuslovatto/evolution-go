@@ -11,6 +11,7 @@ package whatsmeow_service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -362,4 +363,81 @@ func TestCobaltoP3Undecryptable6667PassaPeloLoop(t *testing.T) {
 		t.Fatalf("connector chamado %d vez(es), quer 2", n)
 	}
 	p3Stop(h, mycli)
+}
+
+// R1: sessão encerrada pelo WhatsApp (sessionEnded) não entra na fila de
+// relogin.
+func TestCobaltoP3SessaoEncerradaRecusaRelogin(t *testing.T) {
+	mycli := &MyClient{config: &config.Config{}, relogin: make(chan struct{}, 1)}
+	mycli.stopSession()
+	if mycli.requestRelogin() {
+		t.Fatal("relogin aceito depois de sessionEnded")
+	}
+	if ok, _ := mycli.beginRelogin(); ok {
+		t.Fatal("beginRelogin aceitou sessão encerrada")
+	}
+	if len(mycli.relogin) != 0 {
+		t.Fatal("pedido de relogin ficou na fila")
+	}
+}
+
+// R1, janela do connect: o evento terminal chega enquanto o loop reconecta.
+// Com sucesso, a conexão é desfeita; com falha, nada de ReconnectClient/retry
+// (seria QR novo sozinho depois de logout). Nos dois casos o loop segue vivo
+// para o kill.
+func TestCobaltoP3EventoTerminalDuranteOConnect(t *testing.T) {
+	for _, connectFails := range []bool{false, true} {
+		name := "connect_ok"
+		if connectFails {
+			name = "connect_falha"
+		}
+		t.Run(name, func(t *testing.T) {
+			var mycli *MyClient
+			h := startAgulha(t, false, func(call int32) error {
+				if call == 0 {
+					return nil
+				}
+				mycli.stopSession() // LoggedOut/ban/StreamReplaced durante o connect
+				if connectFails {
+					return errors.New("device removed")
+				}
+				return nil
+			})
+			mycli = h.waitReady(t)
+			spy := &reconnectSpy{WhatsmeowService: h.service}
+			mycli.service = spy
+			p3Pair(t, mycli)
+
+			if !mycli.requestRelogin() {
+				t.Fatal("relogin de sessão viva deveria entrar na fila")
+			}
+			if _, ok := p3WaitReady(t, h, 5*time.Second); !ok {
+				t.Fatal("loop não pegou o pedido de relogin")
+			}
+			time.Sleep(300 * time.Millisecond)
+			select {
+			case <-h.startDone:
+				t.Fatal("loop saiu: o kill pendente não seria tratado")
+			default:
+			}
+			if spy.calls != 0 || spy.retries != 0 {
+				t.Fatalf("sessão encerrada foi \"recuperada\" (reconnect=%d retries=%d)", spy.calls, spy.retries)
+			}
+			if mycli.WAClient.IsConnected() {
+				t.Fatal("cliente de sessão encerrada ficou conectado")
+			}
+			if n := atomic.LoadInt32(h.connects); n != 2 {
+				t.Fatalf("connector chamado %d vez(es), quer 2", n)
+			}
+			h.service.killChannel["inst-agulha"] <- true
+			select {
+			case <-h.startDone:
+			case <-time.After(10 * time.Second):
+				t.Fatal("kill não parou o cliente")
+			}
+			if n := atomic.LoadInt32(h.connects); n != 2 {
+				t.Fatalf("kill depois de sessionEnded reiniciou (connector %d vez(es))", n)
+			}
+		})
+	}
 }
